@@ -7,6 +7,7 @@ const express = require('express');
 const cors = require('cors');
 const snowflake = require('snowflake-sdk');
 const fetch = require('node-fetch'); // Use node-fetch for making http requests in Node
+const path = require('path');
 
 // --- Setup ---
 const app = express();
@@ -630,6 +631,19 @@ app.post('/api/schedule', async (req, res) => {
         res.status(500).json({ error: 'An internal server error occurred.', details: e.message });
     }
 });
+
+// =================================================================
+// --- SERVE REACT FRONTEND ---
+// THIS MUST BE AFTER ALL API ROUTES
+// =================================================================
+app.use(express.static(path.join(__dirname, 'frontend/build')));
+
+// The "catchall" handler: for any request that doesn't
+// match one above, send back React's index.html file.
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'frontend/build/index.html'));
+});
+
 
 
 // --- Start Server ---
