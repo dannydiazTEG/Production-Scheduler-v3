@@ -13,8 +13,9 @@ const app = express();
 const port = 3001;
 
 // --- Middleware ---
+// IMPORTANT: Update this with your live frontend URL for production
 const corsOptions = {
-  origin: 'https://tegproductiondb--new-version-test-qdre2jcs.web.app' // <-- Replace with your Firebase URL
+  origin: 'https://tegproductiondb--new-version-test-qdre2jcs.web.app' 
 };
 app.use(cors(corsOptions));
 app.use(express.json({ limit: '50mb' }));
@@ -121,7 +122,7 @@ async function prepareProjectData(projectTasks) {
         return { tasks: [], logs: ["No projects were provided to prepare."], completedTasks: [] };
     }
 
-    let completedOperationsSet = new Set();
+    let completedOperations = new Set();
     let completedTasksForReport = [];
     
     if (!snowflakeConnection.isUp()) {
@@ -153,7 +154,7 @@ async function prepareProjectData(projectTasks) {
 
         liveCompletedTasks.forEach(row => {
             const key = `${row.JOBNAME}|${row.ITEMREFERENCE_NUMBER}|${row.JOBOPERATIONNAME}`;
-            completedOperationsSet.add(key);
+            completedOperations.add(key);
             completedTasksForReport.push({
                 Project: row.JOBNAME,
                 SKU: row.ITEMREFERENCE_NUMBER,
@@ -165,7 +166,7 @@ async function prepareProjectData(projectTasks) {
 
     const remainingTasks = projectTasks.filter(task => {
         const operationKey = `${task.Project}|${task.SKU}|${task.Operation}`;
-        return !completedOperationsSet.has(operationKey);
+        return !completedOperations.has(operationKey);
     });
 
     logs.push(`Filtered out ${projectTasks.length - remainingTasks.length} completed operations based on Snowflake data.`);
