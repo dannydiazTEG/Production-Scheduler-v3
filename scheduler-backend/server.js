@@ -295,15 +295,15 @@ const runSchedulingEngine = async (
                 continue;
             }
             
-            const ready_tasks_for_dwelling_check = unscheduled_tasks.filter(task => {
+            const isReady = (task) => {
                 if (current_date < task.StartDate) return false;
                 const key = `${task.Project}|${task.SKU}`;
                 const allSkuTasks = schedulableTasksMap.get(key) || [];
-                const predecessors = allSkuTasks.filter(t => t.Order < task.Order).sort((a, b) => b.Order - a.Order);
-                if (predecessors.length === 0) return true;
-                const lastSchedulablePredecessor = predecessors[0];
-                return completed_operations.some(c => c.TaskID === lastSchedulablePredecessor.TaskID);
-            });
+                const predecessors = allSkuTasks.filter(t => t.Order < task.Order);
+                return predecessors.every(p => completed_operations.some(c => c.TaskID === p.TaskID));
+            };
+
+            const ready_tasks_for_dwelling_check = unscheduled_tasks.filter(isReady);
             const dwellingHoursToday = {};
             ready_tasks_for_dwelling_check.forEach(task => {
                 if (!dwellingHoursToday[task.Team]) {
@@ -361,15 +361,7 @@ const runSchedulingEngine = async (
 
             while (more_work_to_assign_today) {
                 more_work_to_assign_today = false;
-                const ready_tasks = unscheduled_tasks.filter(task => {
-                    if (current_date < task.StartDate) return false;
-                    const key = `${task.Project}|${task.SKU}`;
-                    const allSkuTasks = schedulableTasksMap.get(key) || [];
-                    const predecessors = allSkuTasks.filter(t => t.Order < task.Order).sort((a, b) => b.Order - a.Order);
-                    if (predecessors.length === 0) return true;
-                    const lastSchedulablePredecessor = predecessors[0];
-                    return completed_operations.some(c => c.TaskID === lastSchedulablePredecessor.TaskID);
-                }).sort((a,b) => b.DynamicPriority - a.DynamicPriority);
+                const ready_tasks = unscheduled_tasks.filter(isReady).sort((a,b) => b.DynamicPriority - a.DynamicPriority);
 
                 if (ready_tasks.length > 0) {
                     for (const team_name in daily_capacity) {
