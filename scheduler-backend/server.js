@@ -13,7 +13,10 @@ const app = express();
 const port = 3001;
 
 // --- Middleware ---
-app.use(cors());
+const corsOptions = {
+  origin: 'https://tegproductiondb--new-version-test-qdre2jcs.web.app' // <-- Replace with your Firebase URL
+};
+app.use(cors(corsOptions));
 app.use(express.json({ limit: '50mb' }));
 
 // --- CONSTANTS ---
