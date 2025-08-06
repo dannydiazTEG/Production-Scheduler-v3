@@ -7,7 +7,6 @@ const express = require('express');
 const cors = require('cors');
 const snowflake = require('snowflake-sdk');
 const fetch = require('node-fetch'); // Use node-fetch for making http requests in Node
-const path = require('path');
 
 // --- Setup ---
 const app = express();
@@ -116,20 +115,21 @@ async function prepareProjectData(projectTasks) {
     const projectNumbers = [...new Set(projectTasks.map(p => p['Project']))];
 
     if (projectNumbers.length === 0) {
-        return { tasks: [], logs: ["No projects were provided to prepare."] };
+        return { tasks: [], logs: ["No projects were provided to prepare."], completedTasks: [] };
     }
 
-    let completedOperations = new Set();
+    let completedOperationsSet = new Set();
+    let completedTasksForReport = [];
     
     if (!snowflakeConnection.isUp()) {
         logs.push('Snowflake connection is down. Cannot fetch live data. Proceeding with template routing only.');
     } else {
         const placeholders = projectNumbers.map(() => '?').join(',');
         const query = `
-            SELECT JobName, ItemReference_Number, JobOperationName
+            SELECT JOBNAME, ITEMREFERENCE_NUMBER, JOBOPERATIONNAME, CREATEDUTC
             FROM JOBLOG 
-            WHERE LogType = 'OperationRunCompleted'
-            AND JobName IN (${placeholders});
+            WHERE LOGTYPE = 'OperationRunCompleted'
+            AND JOBNAME IN (${placeholders});
         `;
 
         const liveCompletedTasks = await new Promise((resolve) => {
@@ -149,18 +149,25 @@ async function prepareProjectData(projectTasks) {
         });
 
         liveCompletedTasks.forEach(row => {
-            completedOperations.add(`${row.JOBNAME}|${row.ITEMREFERENCE_NUMBER}|${row.JOBOPERATIONNAME}`);
+            const key = `${row.JOBNAME}|${row.ITEMREFERENCE_NUMBER}|${row.JOBOPERATIONNAME}`;
+            completedOperationsSet.add(key);
+            completedTasksForReport.push({
+                Project: row.JOBNAME,
+                SKU: row.ITEMREFERENCE_NUMBER,
+                Operation: row.JOBOPERATIONNAME,
+                CompletionDate: formatDate(row.CREATEDUTC)
+            });
         });
     }
 
     const remainingTasks = projectTasks.filter(task => {
         const operationKey = `${task.Project}|${task.SKU}|${task.Operation}`;
-        return !completedOperations.has(operationKey);
+        return !completedOperationsSet.has(operationKey);
     });
 
     logs.push(`Filtered out ${projectTasks.length - remainingTasks.length} completed operations based on Snowflake data.`);
     
-    return { tasks: remainingTasks, logs };
+    return { tasks: remainingTasks, logs, completedTasks: completedTasksForReport };
 }
 
 
@@ -600,7 +607,7 @@ app.post('/api/schedule', async (req, res) => {
     }
 
     try {
-        const { tasks: preparedTasks, logs: prepLogs } = await prepareProjectData(projectTasks);
+        const { tasks: preparedTasks, logs: prepLogs, completedTasks } = await prepareProjectData(projectTasks);
 
         if (preparedTasks.length === 0) {
             const combinedLogs = [...prepLogs, "All tasks for the submitted projects are already complete."];
@@ -614,6 +621,7 @@ app.post('/api/schedule', async (req, res) => {
                 recommendations: [],
                 projectedCompletion: null, 
                 logs: combinedLogs, 
+                completedTasks: completedTasks,
                 error: '' 
             });
         }
@@ -624,26 +632,13 @@ app.post('/api/schedule', async (req, res) => {
         );
         
         const combinedLogs = [...prepLogs, ...(results.logs || [])];
-        res.json({ ...results, logs: combinedLogs });
+        res.json({ ...results, logs: combinedLogs, completedTasks });
 
     } catch (e) {
         console.error('Failed to run scheduling engine:', e);
         res.status(500).json({ error: 'An internal server error occurred.', details: e.message });
     }
 });
-
-// =================================================================
-// --- SERVE REACT FRONTEND ---
-// THIS MUST BE AFTER ALL API ROUTES
-// =================================================================
-app.use(express.static(path.join(__dirname, 'frontend/build')));
-
-// The "catchall" handler: for any request that doesn't
-// match one above, send back React's index.html file.
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'frontend/build/index.html'));
-});
-
 
 
 // --- Start Server ---
