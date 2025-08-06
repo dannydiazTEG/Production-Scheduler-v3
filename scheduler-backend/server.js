@@ -10,7 +10,7 @@ const fetch = require('node-fetch'); // Use node-fetch for making http requests 
 
 // --- Setup ---
 const app = express();
-const port = 3001;
+const port = process.env.PORT || 3001; // Render provides the port via an environment variable
 
 // --- Middleware ---
 // IMPORTANT: Update this with your live frontend URL for production
