@@ -8,7 +8,6 @@ const app = express();
 const port = process.env.PORT || 3001; // Render provides the port via an environment variable
 
 // --- Middleware ---
-// --- UPDATED: More flexible CORS configuration ---
 const allowedOrigins = [
   'https://tegproductiondb.web.app', // Your main Firebase URL
   /https:\/\/tegproductiondb--.+\.web\.app$/ // A regular expression to match all Firebase preview channels
