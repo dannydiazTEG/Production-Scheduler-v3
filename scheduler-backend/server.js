@@ -2,7 +2,6 @@
 // This is the backend server for your Production Scheduling Engine.
 // It now includes logic for Snowflake integration and dynamic master routing data from a Google Sheet.
 
-require('dotenv').config(); // Loads environment variables from a .env file
 const express = require('express');
 const cors = require('cors');
 const snowflake = require('snowflake-sdk');
