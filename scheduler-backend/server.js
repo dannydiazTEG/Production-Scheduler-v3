@@ -2,7 +2,7 @@
 // This is the backend server for your Production Scheduling Engine.
 // It now includes logic for Snowflake integration and dynamic master routing data from a Google Sheet.
 
-// --- FIX: Only load .env file in development, not in production (like on Render) ---
+// NOTE: We are not using dotenv in production. Render provides environment variables directly.
 if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
 }
