@@ -8,8 +8,28 @@ const app = express();
 const port = process.env.PORT || 3001; // Render provides the port via an environment variable
 
 // --- Middleware ---
-// --- TEMPORARY DEBUGGING STEP: Allow all origins to rule out CORS issues ---
-app.use(cors()); 
+// --- UPDATED: More flexible CORS configuration ---
+const allowedOrigins = [
+  'https://tegproductiondb.web.app', // Your main Firebase URL
+  /https:\/\/tegproductiondb--.+\.web\.app$/ // A regular expression to match all Firebase preview channels
+];
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    // allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.some(allowedOrigin => 
+        typeof allowedOrigin === 'string' 
+            ? allowedOrigin === origin 
+            : allowedOrigin.test(origin)
+    )) {
+      return callback(null, true);
+    } else {
+      return callback(new Error('Not allowed by CORS'));
+    }
+  }
+};
+app.use(cors(corsOptions));
 app.use(express.json({ limit: '50mb' }));
 
 // --- CONSTANTS ---
