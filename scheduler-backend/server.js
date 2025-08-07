@@ -8,9 +8,26 @@ const app = express();
 const port = process.env.PORT || 3001; // Render provides the port via an environment variable
 
 // --- Middleware ---
-// IMPORTANT: Update this with your live frontend URL for production
+// --- UPDATED: More flexible CORS configuration ---
+const allowedOrigins = [
+  'https://tegproductiondb.web.app', // Your main Firebase URL
+  /https:\/\/tegproductiondb--.+\.web\.app$/ // A regular expression to match all Firebase preview channels
+];
+
 const corsOptions = {
-  origin: 'https://tegproductiondb--new-version-test-qdre2jcs.web.app' 
+  origin: function (origin, callback) {
+    // allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.some(allowedOrigin => 
+        typeof allowedOrigin === 'string' 
+            ? allowedOrigin === origin 
+            : allowedOrigin.test(origin)
+    )) {
+      return callback(null, true);
+    } else {
+      return callback(new Error('Not allowed by CORS'));
+    }
+  }
 };
 app.use(cors(corsOptions));
 app.use(express.json({ limit: '50mb' }));
@@ -652,8 +669,8 @@ const startServer = async () => {
         console.error("CRITICAL: Could not establish initial connection to Snowflake. Server will start but will not be able to query live data.");
     }
 
-    app.listen(port, () => {
-        console.log(`Scheduler backend listening on http://localhost:${port}`);
+    app.listen(port, '0.0.0.0', () => {
+        console.log(`Scheduler backend listening on port ${port}`);
     });
 };
 
