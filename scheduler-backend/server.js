@@ -1,7 +1,3 @@
-// server.js
-// This is the backend server for your Production Scheduling Engine.
-// It now includes logic for Snowflake integration and dynamic master routing data from a Google Sheet.
-
 const express = require('express');
 const cors = require('cors');
 const snowflake = require('snowflake-sdk');
@@ -12,9 +8,26 @@ const app = express();
 const port = process.env.PORT || 3001; // Render provides the port via an environment variable
 
 // --- Middleware ---
-// IMPORTANT: Update this with your live frontend URL for production
+// --- UPDATED: More flexible CORS configuration ---
+const allowedOrigins = [
+  'https://tegproductiondb.web.app', // Your main Firebase URL
+  /https:\/\/tegproductiondb--.+\.web\.app$/ // A regular expression to match all Firebase preview channels
+];
+
 const corsOptions = {
-  origin: 'https://tegproductiondb--new-version-test-qdre2jcs.web.app' 
+  origin: function (origin, callback) {
+    // allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.some(allowedOrigin => 
+        typeof allowedOrigin === 'string' 
+            ? allowedOrigin === origin 
+            : allowedOrigin.test(origin)
+    )) {
+      return callback(null, true);
+    } else {
+      return callback(new Error('Not allowed by CORS'));
+    }
+  }
 };
 app.use(cors(corsOptions));
 app.use(express.json({ limit: '50mb' }));
