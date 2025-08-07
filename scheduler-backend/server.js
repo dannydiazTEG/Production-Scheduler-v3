@@ -669,7 +669,7 @@ const startServer = async () => {
     }
 
     app.listen(port, '0.0.0.0', () => {
-        console.log(`Scheduler backend listening on port ${port}`);
+        console.log(`SERVER IS LIVE AND LISTENING ON ALL INTERFACES - Port: ${port}`);
     });
 };
 
