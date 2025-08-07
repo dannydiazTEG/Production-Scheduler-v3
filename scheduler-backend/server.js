@@ -1,3 +1,12 @@
+// server.js
+// This is the backend server for your Production Scheduling Engine.
+// It now includes logic for Snowflake integration and dynamic master routing data from a Google Sheet.
+
+// --- FIX: Only load .env file in development, not in production (like on Render) ---
+if (process.env.NODE_ENV !== 'production') {
+  require('dotenv').config();
+}
+
 const express = require('express');
 const cors = require('cors');
 const snowflake = require('snowflake-sdk');
@@ -15,10 +24,8 @@ const allowedOrigins = [
 
 const corsOptions = {
   origin: function (origin, callback) {
-    // --- NEW: Detailed logging for every request ---
     console.log(`CORS Check: Request from origin: ${origin}`);
     
-    // allow requests with no origin (like mobile apps or curl requests)
     if (!origin) {
         console.log('CORS Check: No origin, allowing.');
         return callback(null, true);
