@@ -11,6 +11,7 @@ const express = require('express');
 const cors = require('cors');
 const snowflake = require('snowflake-sdk');
 const fetch = require('node-fetch'); // Use node-fetch for making http requests in Node
+const crypto = require('crypto');
 
 // --- Setup ---
 const app = express();
@@ -46,6 +47,9 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 app.use(express.json({ limit: '50mb' }));
+
+// --- In-memory store for job statuses ---
+const jobs = {};
 
 // --- CONSTANTS ---
 const TEAM_SORT_ORDER = ['CNC', 'Metal', 'Scenic', 'Paint', 'Carpentry', 'Assembly', 'Tech', 'Hybrid'];
@@ -141,7 +145,7 @@ const getWeekStartDate = (date) => {
 };
 
 // --- Data Preparation Logic with Snowflake ---
-async function prepareProjectData(projectTasks) {
+async function prepareProjectData(projectTasks, updateProgress) {
     const logs = [];
     const projectNumbers = [...new Set(projectTasks.map(p => p['Project']))];
 
@@ -149,6 +153,7 @@ async function prepareProjectData(projectTasks) {
         return { tasks: [], logs: ["No projects were provided to prepare."], completedTasks: [] };
     }
 
+    updateProgress(5, 'checking', 'Querying Snowflake for completed tasks...');
     let completedOperations = new Set();
     let completedTasksForReport = [];
     
@@ -191,6 +196,7 @@ async function prepareProjectData(projectTasks) {
         });
     }
 
+    updateProgress(10, 'preparing', 'Filtering out completed tasks...');
     const remainingTasks = projectTasks.filter(task => {
         const operationKey = `${task.Project}|${task.SKU}|${task.Operation}`;
         return !completedOperations.has(operationKey);
@@ -205,7 +211,7 @@ async function prepareProjectData(projectTasks) {
 // --- Core Scheduling Logic ---
 const runSchedulingEngine = async (
     preparedTasks, params, teamDefs, ptoEntries, teamMemberChanges,
-    workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap
+    workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap, updateProgress
 ) => {
     const logs = [];
     let error = '';
@@ -240,6 +246,7 @@ const runSchedulingEngine = async (
     
     try {
         logs.push("--- Starting Scheduling Simulation on Server ---");
+        updateProgress(15, 'preparing', 'Assigning teams and calculating priorities...');
         const holidayList = new Set(params.holidays.split(',').map(d => d.trim()).filter(Boolean));
         const ptoMap = ptoEntries.reduce((acc, curr) => { if (curr.date && curr.memberName) { if (!acc[curr.date]) acc[curr.date] = new Set(); acc[curr.date].add(curr.memberName.trim()); } return acc; }, {});
         const teamMapping = teamDefs.mapping;
@@ -307,6 +314,7 @@ const runSchedulingEngine = async (
         });
 
         let unscheduled_tasks = [...operations_df];
+        const totalTasks = unscheduled_tasks.length;
         let current_date = parseDate(params.startDate);
         let daily_log_entries = [], completed_operations = [];
         logs.push(`Starting with ${unscheduled_tasks.length} schedulable tasks.`);
@@ -316,6 +324,12 @@ const runSchedulingEngine = async (
         while(unscheduled_tasks.length > 0 && loopCounter < maxDays) {
             const dayOfWeek = current_date.getDay();
             const currentDateStr = formatDate(current_date);
+
+            if(loopCounter % 7 === 0) { // Update progress weekly
+                const progress = 20 + Math.round(((totalTasks - unscheduled_tasks.length) / totalTasks) * 65);
+                updateProgress(progress, 'simulating', `Simulating week of ${currentDateStr}...`);
+            }
+
             if (dayOfWeek === 6 || dayOfWeek === 0 || holidayList.has(currentDateStr)) {
                 current_date.setDate(current_date.getDate() + 1);
                 loopCounter++;
@@ -454,6 +468,7 @@ const runSchedulingEngine = async (
             loopCounter++;
         }
         
+        updateProgress(85, 'finalizing', 'Aggregating results...');
         const projectSummaryMap = {};
         daily_log_entries.forEach(log => {
             const proj = log.Project;
