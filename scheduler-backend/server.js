@@ -1,7 +1,8 @@
 // server.js
 // This is the backend server for your Production Scheduling Engine.
-// It now includes logic for Snowflake integration and asynchronous job processing.
+// It now includes logic for Snowflake integration and dynamic master routing data from a Google Sheet.
 
+// NOTE: We are not using dotenv in production. Render provides environment variables directly.
 if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
 }
@@ -9,24 +10,33 @@ if (process.env.NODE_ENV !== 'production') {
 const express = require('express');
 const cors = require('cors');
 const snowflake = require('snowflake-sdk');
-const fetch = require('node-fetch');
-const { v4: uuidv4 } = require('uuid'); // To generate unique job IDs
+const fetch = require('node-fetch'); // Use node-fetch for making http requests in Node
 
 // --- Setup ---
 const app = express();
-const port = process.env.PORT || 3001;
+const port = process.env.PORT || 3001; // Render provides the port via an environment variable
 
 // --- Middleware ---
 const allowedOrigins = [
-  'https://tegproductiondb.web.app',
-  /https:\/\/tegproductiondb--.+\.web\.app$/
+  'https://tegproductiondb.web.app', // Your main Firebase URL
+  /https:\/\/tegproductiondb--.+\.web\.app$/ // A regular expression to match all Firebase preview channels
 ];
 
 const corsOptions = {
   origin: function (origin, callback) {
     console.log(`CORS Check: Request from origin: ${origin}`);
-    if (!origin || allowedOrigins.some(allowed => typeof allowed === 'string' ? allowed === origin : allowed.test(origin))) {
-      console.log(`CORS Check: Origin ${origin || 'none'} is allowed.`);
+    
+    if (!origin) {
+        console.log('CORS Check: No origin, allowing.');
+        return callback(null, true);
+    }
+    
+    if (allowedOrigins.some(allowedOrigin => 
+        typeof allowedOrigin === 'string' 
+            ? allowedOrigin === origin 
+            : allowedOrigin.test(origin)
+    )) {
+      console.log(`CORS Check: Origin ${origin} is allowed.`);
       return callback(null, true);
     } else {
       console.error(`CORS Check: Origin ${origin} is NOT allowed.`);
@@ -36,9 +46,6 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 app.use(express.json({ limit: '50mb' }));
-
-// --- In-memory store for async jobs ---
-const jobs = {};
 
 // --- CONSTANTS ---
 const TEAM_SORT_ORDER = ['CNC', 'Metal', 'Scenic', 'Paint', 'Carpentry', 'Assembly', 'Tech', 'Hybrid'];
@@ -134,7 +141,7 @@ const getWeekStartDate = (date) => {
 };
 
 // --- Data Preparation Logic with Snowflake ---
-async function prepareProjectData(projectTasks, updateProgress) {
+async function prepareProjectData(projectTasks) {
     const logs = [];
     const projectNumbers = [...new Set(projectTasks.map(p => p['Project']))];
 
@@ -147,9 +154,7 @@ async function prepareProjectData(projectTasks, updateProgress) {
     
     if (!snowflakeConnection.isUp()) {
         logs.push('Snowflake connection is down. Cannot fetch live data. Proceeding with template routing only.');
-        updateProgress(10, 'Snowflake connection down. Skipping check...');
     } else {
-        updateProgress(5, 'Querying Snowflake for completed tasks...');
         const placeholders = projectNumbers.map(() => '?').join(',');
         const query = `
             SELECT JOBNAME, ITEMREFERENCE_NUMBER, JOBOPERATIONNAME, CREATEDUTC
@@ -173,7 +178,6 @@ async function prepareProjectData(projectTasks, updateProgress) {
                 }
             });
         });
-        updateProgress(10, 'Processing Snowflake results...');
 
         liveCompletedTasks.forEach(row => {
             const key = `${row.JOBNAME}|${row.ITEMREFERENCE_NUMBER}|${row.JOBOPERATIONNAME}`;
@@ -201,13 +205,8 @@ async function prepareProjectData(projectTasks, updateProgress) {
 // --- Core Scheduling Logic ---
 const runSchedulingEngine = async (
     preparedTasks, params, teamDefs, ptoEntries, teamMemberChanges,
-    workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
-    updateProgress // Callback to update job status
+    workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap
 ) => {
-    // ... (The entire scheduling logic from the previous version remains the same here)
-    // For brevity, I'm omitting the large block of scheduling code.
-    // The key change is to call `updateProgress` at different stages.
-    
     const logs = [];
     let error = '';
 
@@ -241,7 +240,6 @@ const runSchedulingEngine = async (
     
     try {
         logs.push("--- Starting Scheduling Simulation on Server ---");
-        updateProgress(15, 'Initializing simulation parameters...');
         const holidayList = new Set(params.holidays.split(',').map(d => d.trim()).filter(Boolean));
         const ptoMap = ptoEntries.reduce((acc, curr) => { if (curr.date && curr.memberName) { if (!acc[curr.date]) acc[curr.date] = new Set(); acc[curr.date].add(curr.memberName.trim()); } return acc; }, {});
         const teamMapping = teamDefs.mapping;
@@ -316,9 +314,6 @@ const runSchedulingEngine = async (
         let dailyDwellingData = {};
 
         while(unscheduled_tasks.length > 0 && loopCounter < maxDays) {
-            const progress = 15 + Math.round((loopCounter / maxDays) * 75); // Progress from 15% to 90%
-            updateProgress(progress, `Simulating Day ${loopCounter + 1}...`);
-
             const dayOfWeek = current_date.getDay();
             const currentDateStr = formatDate(current_date);
             if (dayOfWeek === 6 || dayOfWeek === 0 || holidayList.has(currentDateStr)) {
@@ -459,7 +454,6 @@ const runSchedulingEngine = async (
             loopCounter++;
         }
         
-        updateProgress(90, 'Finalizing results...');
         const projectSummaryMap = {};
         daily_log_entries.forEach(log => {
             const proj = log.Project;
@@ -624,95 +618,49 @@ const runSchedulingEngine = async (
 
 // --- API Endpoints ---
 app.post('/api/schedule', async (req, res) => {
-    console.log('Received request to /api/schedule to start a new job.');
-    const jobId = uuidv4();
+    console.log('Received request to /api/schedule');
     
-    jobs[jobId] = {
-        status: 'pending',
-        progress: 0,
-        message: 'Job is queued...',
-        step: 'starting',
-        result: null,
-        error: null,
-    };
-
     const { 
         projectTasks, params, teamDefs, ptoEntries, teamMemberChanges,
         workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap
     } = req.body;
 
     if (!projectTasks || !params || !teamDefs) {
-        jobs[jobId].status = 'error';
-        jobs[jobId].error = 'Missing required data from frontend.';
-        return res.status(400).json({ error: jobs[jobId].error });
+        return res.status(400).json({ error: 'Missing required data from frontend.' });
     }
-    
-    // Respond immediately to the client
-    res.status(202).json({ jobId });
 
-    // --- Start the long-running task in the background ---
-    (async () => {
-        try {
-            const updateProgress = (progress, message, step) => {
-                if (jobs[jobId]) {
-                    jobs[jobId].progress = progress;
-                    jobs[jobId].message = message;
-                    if (step) jobs[jobId].step = step;
-                }
-            };
+    try {
+        const { tasks: preparedTasks, logs: prepLogs, completedTasks } = await prepareProjectData(projectTasks);
 
-            jobs[jobId].status = 'running';
-            updateProgress(0, 'Preparing project data...', 'preparing');
-            
-            const { tasks: preparedTasks, logs: prepLogs, completedTasks } = await prepareProjectData(projectTasks, updateProgress);
-
-            if (preparedTasks.length === 0) {
-                const combinedLogs = [...prepLogs, "All tasks for the submitted projects are already complete."];
-                jobs[jobId].status = 'complete';
-                jobs[jobId].progress = 100;
-                jobs[jobId].message = 'All tasks were already completed.';
-                jobs[jobId].step = 'done';
-                jobs[jobId].result = { 
-                    finalSchedule: [], projectSummary: [], teamUtilization: [], weeklyOutput: [],
-                    dailyCompletions: [], teamWorkload: [], recommendations: [],
-                    projectedCompletion: null, logs: combinedLogs, completedTasks, error: '' 
-                };
-                return;
-            }
-
-            updateProgress(15, 'Starting scheduling simulation...', 'simulating');
-            const results = await runSchedulingEngine(
-                preparedTasks, params, teamDefs, ptoEntries, teamMemberChanges,
-                workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
-                updateProgress
-            );
-            
-            const combinedLogs = [...prepLogs, ...(results.logs || [])];
-            
-            jobs[jobId].status = 'complete';
-            jobs[jobId].progress = 100;
-            jobs[jobId].message = 'Scheduling complete!';
-            jobs[jobId].step = 'done';
-            jobs[jobId].result = { ...results, logs: combinedLogs, completedTasks };
-
-        } catch (e) {
-            console.error(`[Job ${jobId}] Failed to run scheduling engine:`, e);
-            jobs[jobId].status = 'error';
-            jobs[jobId].error = 'An internal server error occurred during scheduling.';
-            jobs[jobId].result = { details: e.message };
+        if (preparedTasks.length === 0) {
+            const combinedLogs = [...prepLogs, "All tasks for the submitted projects are already complete."];
+            return res.json({ 
+                finalSchedule: [], 
+                projectSummary: [], 
+                teamUtilization: [], 
+                weeklyOutput: [],
+                dailyCompletions: [],
+                teamWorkload: [],
+                recommendations: [],
+                projectedCompletion: null, 
+                logs: combinedLogs, 
+                completedTasks: completedTasks,
+                error: '' 
+            });
         }
-    })();
-});
 
-app.get('/api/schedule/status/:jobId', (req, res) => {
-    const { jobId } = req.params;
-    const job = jobs[jobId];
+        const results = await runSchedulingEngine(
+            preparedTasks, params, teamDefs, ptoEntries, teamMemberChanges,
+            workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap
+        );
+        
+        const combinedLogs = [...prepLogs, ...(results.logs || [])];
+        res.json({ ...results, logs: combinedLogs, completedTasks });
 
-    if (!job) {
-        return res.status(404).json({ error: 'Job not found.' });
+    } catch (e) {
+        console.error('Failed to run scheduling engine:', e);
+        res.status(500).json({ error: 'An internal server error occurred.', details: e.message });
     }
-
-    res.json(job);
 });
 
 
