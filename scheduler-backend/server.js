@@ -204,10 +204,6 @@ const runSchedulingEngine = async (
     workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
     updateProgress // Callback to update job status
 ) => {
-    // ... (The entire scheduling logic from the previous version remains the same here)
-    // For brevity, I'm omitting the large block of scheduling code.
-    // The key change is to call `updateProgress` at different stages.
-    
     const logs = [];
     let error = '';
 
@@ -309,6 +305,7 @@ const runSchedulingEngine = async (
         });
 
         let unscheduled_tasks = [...operations_df];
+        const initialTaskCount = unscheduled_tasks.length;
         let current_date = parseDate(params.startDate);
         let daily_log_entries = [], completed_operations = [];
         logs.push(`Starting with ${unscheduled_tasks.length} schedulable tasks.`);
@@ -316,9 +313,6 @@ const runSchedulingEngine = async (
         let dailyDwellingData = {};
 
         while(unscheduled_tasks.length > 0 && loopCounter < maxDays) {
-            const progress = 15 + Math.round((loopCounter / maxDays) * 75); // Progress from 15% to 90%
-            updateProgress(progress, `Simulating Day ${loopCounter + 1}...`);
-
             const dayOfWeek = current_date.getDay();
             const currentDateStr = formatDate(current_date);
             if (dayOfWeek === 6 || dayOfWeek === 0 || holidayList.has(currentDateStr)) {
@@ -455,6 +449,11 @@ const runSchedulingEngine = async (
                 }
                 unscheduled_tasks = unscheduled_tasks.filter(t => t.HoursRemaining > 0.01);
             }
+            const tasksRemaining = unscheduled_tasks.length;
+            const tasksCompleted = initialTaskCount - tasksRemaining;
+            const progress = 15 + Math.round((tasksCompleted / initialTaskCount) * 75);
+            updateProgress(progress, `Simulating... ${tasksCompleted} of ${initialTaskCount} tasks scheduled.`);
+
             current_date.setDate(current_date.getDate() + 1);
             loopCounter++;
         }
