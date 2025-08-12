@@ -305,12 +305,15 @@ const runSchedulingEngine = async (
         });
 
         let unscheduled_tasks = [...operations_df];
-        const initialTaskCount = unscheduled_tasks.length;
+        const totalWorkloadHours = unscheduled_tasks.reduce((sum, task) => sum + task['Estimated Hours'], 0);
+        let totalHoursCompleted = 0;
         let current_date = parseDate(params.startDate);
         let daily_log_entries = [], completed_operations = [];
         logs.push(`Starting with ${unscheduled_tasks.length} schedulable tasks.`);
         let loopCounter = 0; const maxDays = 365 * 2;
         let dailyDwellingData = {};
+
+        const yieldToEventLoop = () => new Promise(resolve => setTimeout(resolve, 0));
 
         while(unscheduled_tasks.length > 0 && loopCounter < maxDays) {
             const dayOfWeek = current_date.getDay();
@@ -431,6 +434,9 @@ const runSchedulingEngine = async (
                                             const taskInArray = unscheduled_tasks.find(t => t.TaskID === task_to_assign.TaskID);
                                             taskInArray.HoursRemaining -= task_hours_to_complete;
                                             memberInPool.SchedulableHoursLeft -= time_to_spend_on_task;
+                                            
+                                            totalHoursCompleted += task_hours_to_complete;
+
                                             if (taskInArray.HoursRemaining <= 0.01) {
                                                 completed_operations.push({ Project: task_to_assign.Project, SKU: task_to_assign.SKU, Order: task_to_assign.Order, TaskID: task_to_assign.TaskID, CompletionDate: new Date(current_date) });
                                                 if (taskInArray.Order === skuMaxOrderMap[taskInArray.SKU]) {
@@ -449,10 +455,11 @@ const runSchedulingEngine = async (
                 }
                 unscheduled_tasks = unscheduled_tasks.filter(t => t.HoursRemaining > 0.01);
             }
-            const tasksRemaining = unscheduled_tasks.length;
-            const tasksCompleted = initialTaskCount - tasksRemaining;
-            const progress = 15 + Math.round((tasksCompleted / initialTaskCount) * 75);
-            updateProgress(progress, `Simulating... ${tasksCompleted} of ${initialTaskCount} tasks scheduled.`);
+            if (loopCounter % 5 === 0) { // Update progress every 5 simulated days
+                const progress = 15 + Math.round((totalHoursCompleted / totalWorkloadHours) * 75);
+                updateProgress(progress, `Simulating Day ${loopCounter + 1}...`);
+                await yieldToEventLoop(); // Allow other requests to be processed
+            }
 
             current_date.setDate(current_date.getDate() + 1);
             loopCounter++;
