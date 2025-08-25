@@ -1,7 +1,7 @@
 // server.js
 // This is the backend server for your Production Scheduling Engine.
 // It now includes logic for Snowflake integration and asynchronous job processing.
-// --- VERSION 2: Includes a resilient Snowflake connection handler ---
+// --- VERSION 3: Uses a resilient Snowflake connection pool ---
 
 if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
@@ -25,9 +25,10 @@ const allowedOrigins = [
 
 const corsOptions = {
   origin: function (origin, callback) {
-    console.log(`CORS Check: Request from origin: ${origin}`);
+    // Note: In a production environment, you might remove these logs for cleaner output.
+    // console.log(`CORS Check: Request from origin: ${origin}`);
     if (!origin || allowedOrigins.some(allowed => typeof allowed === 'string' ? allowed === origin : allowed.test(origin))) {
-      console.log(`CORS Check: Origin ${origin || 'none'} is allowed.`);
+      // console.log(`CORS Check: Origin ${origin || 'none'} is allowed.`);
       return callback(null, true);
     } else {
       console.error(`CORS Check: Origin ${origin} is NOT allowed.`);
@@ -97,38 +98,26 @@ async function loadMasterRoutingData() {
 }
 
 // =================================================================
-// --- SNOWFLAKE CONNECTION ---
+// --- SNOWFLAKE CONNECTION POOL ---
 // =================================================================
-const snowflakeConnection = snowflake.createConnection({
+// --- MODIFIED ---
+// Replaced the single connection with a connection pool.
+// The pool manages connections, handles automatic reconnects, and prevents stale connection issues.
+const snowflakePool = snowflake.createPool({
     account: process.env.SNOWFLAKE_ACCOUNT,
     username: process.env.SNOWFLAKE_USER,
     password: process.env.SNOWFLAKE_PASSWORD,
     warehouse: process.env.SNOWFLAKE_WAREHOUSE,
     database: process.env.SNOWFLAKE_DATABASE,
     schema: process.env.SNOWFLAKE_SCHEMA
+}, {
+    max: 10, // max number of connections in the pool
+    min: 1   // min number of connections in the pool
 });
 
-// --- NEW --- Resilient connection handler
-// This function checks if the connection is active and reconnects if it's not.
-const ensureSnowflakeConnection = () => {
-  return new Promise((resolve, reject) => {
-    if (snowflakeConnection.isUp()) {
-      console.log('Snowflake connection is already active.');
-      return resolve();
-    }
-
-    console.log('Snowflake connection is down. Attempting to connect...');
-    snowflakeConnection.connect((err, conn) => {
-      if (err) {
-        console.error('Failed to reconnect to Snowflake:', err.message);
-        return reject(err);
-      }
-      console.log('Successfully reconnected to Snowflake.');
-      resolve(conn);
-    });
-  });
-};
-
+// --- REMOVED ---
+// The old `ensureSnowflakeConnection` function is no longer needed.
+// The connection pool handles this logic automatically and more reliably.
 
 // --- Helper Functions ---
 const parseDate = (dateStr) => {
@@ -169,42 +158,47 @@ async function prepareProjectData(projectTasks, updateProgress) {
     let completedTasksForReport = [];
     
     // --- MODIFIED SECTION ---
-    // We now wrap the connection attempt in a try/catch block.
+    // We now use the connection pool to execute queries.
+    // A try/catch block gracefully handles any potential connection or query errors.
+    let liveCompletedTasks = [];
     try {
-        await ensureSnowflakeConnection(); // Ensure the connection is active before proceeding.
-    } catch (error) {
-        logs.push(`Snowflake connection failed and could not be re-established: ${error.message}. Proceeding without live data.`);
-        updateProgress(10, 'Snowflake connection failed. Skipping check...');
-        // Return all tasks as if none were completed, as we can't verify.
-        return { tasks: projectTasks, logs, completedTasks: [] };
+        updateProgress(5, 'Querying Snowflake for completed tasks...');
+        const placeholders = projectNumbers.map(() => '?').join(',');
+        const query = `
+            SELECT JOBNAME, ITEMREFERENCE_NUMBER, JOBOPERATIONNAME, CREATEDUTC
+            FROM JOBLOG 
+            WHERE LOGTYPE = 'OperationRunCompleted'
+            AND JOBNAME IN (${placeholders});
+        `;
+
+        // Use the pool to get a connection and execute the query.
+        // `pool.use` automatically handles acquiring and releasing the connection.
+        await snowflakePool.use(async (connection) => {
+            const statement = await connection.execute({
+                sqlText: query,
+                binds: projectNumbers,
+            });
+
+            // Await the streaming of rows into an array
+            liveCompletedTasks = await new Promise((resolve, reject) => {
+                const rows = [];
+                statement.streamRows()
+                    .on('error', (err) => reject(err))
+                    .on('data', (row) => rows.push(row))
+                    .on('end', () => resolve(rows));
+            });
+        });
+
+        logs.push(`Found ${liveCompletedTasks.length} completed operations in Snowflake.`);
+        updateProgress(10, 'Processing Snowflake results...');
+
+    } catch (err) {
+        logs.push(`Snowflake Error: ${err.message}. Proceeding without live data.`);
+        console.error('Snowflake query failed:', err);
+        updateProgress(10, 'Snowflake query failed. Skipping check...');
+        liveCompletedTasks = []; // Ensure it's an empty array on failure
     }
     
-    updateProgress(5, 'Querying Snowflake for completed tasks...');
-    const placeholders = projectNumbers.map(() => '?').join(',');
-    const query = `
-        SELECT JOBNAME, ITEMREFERENCE_NUMBER, JOBOPERATIONNAME, CREATEDUTC
-        FROM JOBLOG 
-        WHERE LOGTYPE = 'OperationRunCompleted'
-        AND JOBNAME IN (${placeholders});
-    `;
-
-    const liveCompletedTasks = await new Promise((resolve) => {
-        snowflakeConnection.execute({
-            sqlText: query,
-            binds: projectNumbers,
-            complete: (err, stmt, rows) => {
-                if (err) {
-                    logs.push(`SQL Error fetching completed operations: ${err.message}. Proceeding without live data.`);
-                    resolve([]);
-                } else {
-                    logs.push(`Found ${rows.length} completed operations in Snowflake.`);
-                    resolve(rows);
-                }
-            }
-        });
-    });
-    updateProgress(10, 'Processing Snowflake results...');
-
     liveCompletedTasks.forEach(row => {
         const key = `${row.JOBNAME}|${row.ITEMREFERENCE_NUMBER}|${row.JOBOPERATIONNAME}`;
         completedOperations.add(key);
@@ -229,6 +223,7 @@ async function prepareProjectData(projectTasks, updateProgress) {
 
 
 // --- Core Scheduling Logic ---
+// ... (The entire runSchedulingEngine function remains unchanged) ...
 const runSchedulingEngine = async (
     preparedTasks, params, teamDefs, ptoEntries, teamMemberChanges,
     workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
@@ -756,20 +751,18 @@ app.get('/api/schedule/status/:jobId', (req, res) => {
 const startServer = async () => {
     await loadMasterRoutingData();
     
+    // --- MODIFIED ---
+    // We no longer try a persistent connect() on startup.
+    // Instead, we run a simple test query using the pool.
+    // This confirms credentials are correct but doesn't stop the server from starting if Snowflake is temporarily down.
+    console.log("Testing Snowflake pool connection...");
     try {
-        await new Promise((resolve, reject) => {
-            snowflakeConnection.connect((err, conn) => {
-                if (err) {
-                    console.error('Unable to connect to Snowflake: ' + err.message);
-                    reject(err);
-                } else {
-                    console.log('Successfully connected to Snowflake.');
-                    resolve(conn);
-                }
-            });
+        await snowflakePool.use(async (connection) => {
+            await connection.execute({ sqlText: 'SELECT 1;' });
         });
+        console.log('Successfully connected to Snowflake and tested the connection pool.');
     } catch (err) {
-        console.error("CRITICAL: Could not establish initial connection to Snowflake. Server will start but will not be able to query live data.");
+        console.error(`WARNING: Could not establish initial connection to Snowflake via the pool. The server will still start, but queries will fail until the connection is restored. Error: ${err.message}`);
     }
 
     app.listen(port, '0.0.0.0', () => {
