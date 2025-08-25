@@ -1,6 +1,7 @@
 // server.js
 // This is the backend server for your Production Scheduling Engine.
 // It now includes logic for Snowflake integration and asynchronous job processing.
+// --- VERSION 2: Includes a resilient Snowflake connection handler ---
 
 if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
@@ -107,6 +108,28 @@ const snowflakeConnection = snowflake.createConnection({
     schema: process.env.SNOWFLAKE_SCHEMA
 });
 
+// --- NEW --- Resilient connection handler
+// This function checks if the connection is active and reconnects if it's not.
+const ensureSnowflakeConnection = () => {
+  return new Promise((resolve, reject) => {
+    if (snowflakeConnection.isUp()) {
+      console.log('Snowflake connection is already active.');
+      return resolve();
+    }
+
+    console.log('Snowflake connection is down. Attempting to connect...');
+    snowflakeConnection.connect((err, conn) => {
+      if (err) {
+        console.error('Failed to reconnect to Snowflake:', err.message);
+        return reject(err);
+      }
+      console.log('Successfully reconnected to Snowflake.');
+      resolve(conn);
+    });
+  });
+};
+
+
 // --- Helper Functions ---
 const parseDate = (dateStr) => {
     if (!dateStr || typeof dateStr !== 'string') return null;
@@ -145,47 +168,54 @@ async function prepareProjectData(projectTasks, updateProgress) {
     let completedOperations = new Set();
     let completedTasksForReport = [];
     
-    if (!snowflakeConnection.isUp()) {
-        logs.push('Snowflake connection is down. Cannot fetch live data. Proceeding with template routing only.');
-        updateProgress(10, 'Snowflake connection down. Skipping check...');
-    } else {
-        updateProgress(5, 'Querying Snowflake for completed tasks...');
-        const placeholders = projectNumbers.map(() => '?').join(',');
-        const query = `
-            SELECT JOBNAME, ITEMREFERENCE_NUMBER, JOBOPERATIONNAME, CREATEDUTC
-            FROM JOBLOG 
-            WHERE LOGTYPE = 'OperationRunCompleted'
-            AND JOBNAME IN (${placeholders});
-        `;
-
-        const liveCompletedTasks = await new Promise((resolve) => {
-            snowflakeConnection.execute({
-                sqlText: query,
-                binds: projectNumbers,
-                complete: (err, stmt, rows) => {
-                    if (err) {
-                        logs.push(`SQL Error fetching completed operations: ${err.message}. Proceeding without live data.`);
-                        resolve([]);
-                    } else {
-                        logs.push(`Found ${rows.length} completed operations in Snowflake.`);
-                        resolve(rows);
-                    }
-                }
-            });
-        });
-        updateProgress(10, 'Processing Snowflake results...');
-
-        liveCompletedTasks.forEach(row => {
-            const key = `${row.JOBNAME}|${row.ITEMREFERENCE_NUMBER}|${row.JOBOPERATIONNAME}`;
-            completedOperations.add(key);
-            completedTasksForReport.push({
-                Project: row.JOBNAME,
-                SKU: row.ITEMREFERENCE_NUMBER,
-                Operation: row.JOBOPERATIONNAME,
-                CompletionDate: formatDate(row.CREATEDUTC)
-            });
-        });
+    // --- MODIFIED SECTION ---
+    // We now wrap the connection attempt in a try/catch block.
+    try {
+        await ensureSnowflakeConnection(); // Ensure the connection is active before proceeding.
+    } catch (error) {
+        logs.push(`Snowflake connection failed and could not be re-established: ${error.message}. Proceeding without live data.`);
+        updateProgress(10, 'Snowflake connection failed. Skipping check...');
+        // Return all tasks as if none were completed, as we can't verify.
+        return { tasks: projectTasks, logs, completedTasks: [] };
     }
+    
+    updateProgress(5, 'Querying Snowflake for completed tasks...');
+    const placeholders = projectNumbers.map(() => '?').join(',');
+    const query = `
+        SELECT JOBNAME, ITEMREFERENCE_NUMBER, JOBOPERATIONNAME, CREATEDUTC
+        FROM JOBLOG 
+        WHERE LOGTYPE = 'OperationRunCompleted'
+        AND JOBNAME IN (${placeholders});
+    `;
+
+    const liveCompletedTasks = await new Promise((resolve) => {
+        snowflakeConnection.execute({
+            sqlText: query,
+            binds: projectNumbers,
+            complete: (err, stmt, rows) => {
+                if (err) {
+                    logs.push(`SQL Error fetching completed operations: ${err.message}. Proceeding without live data.`);
+                    resolve([]);
+                } else {
+                    logs.push(`Found ${rows.length} completed operations in Snowflake.`);
+                    resolve(rows);
+                }
+            }
+        });
+    });
+    updateProgress(10, 'Processing Snowflake results...');
+
+    liveCompletedTasks.forEach(row => {
+        const key = `${row.JOBNAME}|${row.ITEMREFERENCE_NUMBER}|${row.JOBOPERATIONNAME}`;
+        completedOperations.add(key);
+        completedTasksForReport.push({
+            Project: row.JOBNAME,
+            SKU: row.ITEMREFERENCE_NUMBER,
+            Operation: row.JOBOPERATIONNAME,
+            CompletionDate: formatDate(row.CREATEDUTC)
+        });
+    });
+    // --- END OF MODIFIED SECTION ---
 
     const remainingTasks = projectTasks.filter(task => {
         const operationKey = `${task.Project}|${task.SKU}|${task.Operation}`;
