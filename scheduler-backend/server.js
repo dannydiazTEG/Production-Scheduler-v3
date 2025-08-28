@@ -1,7 +1,7 @@
 // server.js
 // This is the backend server for your Production Scheduling Engine.
 // It now includes logic for Snowflake integration and asynchronous job processing.
-// --- VERSION 3: Uses a resilient Snowflake connection pool ---
+// --- VERSION 3.1: Patched to handle date overrides from the frontend ---
 
 if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
@@ -25,10 +25,7 @@ const allowedOrigins = [
 
 const corsOptions = {
   origin: function (origin, callback) {
-    // Note: In a production environment, you might remove these logs for cleaner output.
-    // console.log(`CORS Check: Request from origin: ${origin}`);
     if (!origin || allowedOrigins.some(allowed => typeof allowed === 'string' ? allowed === origin : allowed.test(origin))) {
-      // console.log(`CORS Check: Origin ${origin || 'none'} is allowed.`);
       return callback(null, true);
     } else {
       console.error(`CORS Check: Origin ${origin} is NOT allowed.`);
@@ -100,9 +97,6 @@ async function loadMasterRoutingData() {
 // =================================================================
 // --- SNOWFLAKE CONNECTION POOL ---
 // =================================================================
-// --- MODIFIED ---
-// Replaced the single connection with a connection pool.
-// The pool manages connections, handles automatic reconnects, and prevents stale connection issues.
 const snowflakePool = snowflake.createPool({
     account: process.env.SNOWFLAKE_ACCOUNT,
     username: process.env.SNOWFLAKE_USER,
@@ -114,10 +108,6 @@ const snowflakePool = snowflake.createPool({
     max: 10, // max number of connections in the pool
     min: 1   // min number of connections in the pool
 });
-
-// --- REMOVED ---
-// The old `ensureSnowflakeConnection` function is no longer needed.
-// The connection pool handles this logic automatically and more reliably.
 
 // --- Helper Functions ---
 const parseDate = (dateStr) => {
@@ -157,9 +147,6 @@ async function prepareProjectData(projectTasks, updateProgress) {
     let completedOperations = new Set();
     let completedTasksForReport = [];
     
-    // --- MODIFIED SECTION ---
-    // We now use the connection pool to execute queries.
-    // A try/catch block gracefully handles any potential connection or query errors.
     let liveCompletedTasks = [];
     try {
         updateProgress(5, 'Querying Snowflake for completed tasks...');
@@ -171,15 +158,12 @@ async function prepareProjectData(projectTasks, updateProgress) {
             AND JOBNAME IN (${placeholders});
         `;
 
-        // Use the pool to get a connection and execute the query.
-        // `pool.use` automatically handles acquiring and releasing the connection.
         await snowflakePool.use(async (connection) => {
             const statement = await connection.execute({
                 sqlText: query,
                 binds: projectNumbers,
             });
 
-            // Await the streaming of rows into an array
             liveCompletedTasks = await new Promise((resolve, reject) => {
                 const rows = [];
                 statement.streamRows()
@@ -196,7 +180,7 @@ async function prepareProjectData(projectTasks, updateProgress) {
         logs.push(`Snowflake Error: ${err.message}. Proceeding without live data.`);
         console.error('Snowflake query failed:', err);
         updateProgress(10, 'Snowflake query failed. Skipping check...');
-        liveCompletedTasks = []; // Ensure it's an empty array on failure
+        liveCompletedTasks = []; 
     }
     
     liveCompletedTasks.forEach(row => {
@@ -209,7 +193,6 @@ async function prepareProjectData(projectTasks, updateProgress) {
             CompletionDate: formatDate(row.CREATEDUTC)
         });
     });
-    // --- END OF MODIFIED SECTION ---
 
     const remainingTasks = projectTasks.filter(task => {
         const operationKey = `${task.Project}|${task.SKU}|${task.Operation}`;
@@ -223,14 +206,24 @@ async function prepareProjectData(projectTasks, updateProgress) {
 
 
 // --- Core Scheduling Logic ---
-// ... (The entire runSchedulingEngine function remains unchanged) ...
 const runSchedulingEngine = async (
     preparedTasks, params, teamDefs, ptoEntries, teamMemberChanges,
     workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
-    updateProgress // Callback to update job status
+    startDateOverrides, endDateOverrides, // <-- FIX: Added parameters
+    updateProgress 
 ) => {
     const logs = [];
     let error = '';
+
+    // <-- FIX: Apply date overrides at the beginning of the simulation
+    const tasksWithOverrides = preparedTasks.map(task => {
+        const newStartDate = startDateOverrides[task.Project];
+        const newDueDate = endDateOverrides[task.Project];
+        // Only apply the override if it exists, otherwise keep the original date.
+        if (newStartDate) task.StartDate = newStartDate;
+        if (newDueDate) task.DueDate = newDueDate;
+        return task;
+    });
 
     const assignTeams = (df, mapping) => {
         const teamMap = mapping.reduce((acc, curr) => ({...acc, [curr.operation]: curr.team }), {});
@@ -269,7 +262,8 @@ const runSchedulingEngine = async (
         let teamHeadcounts = teamDefs.headcounts.reduce((acc, t) => ({...acc, [t.name]: t.count}), {});
         const teamsToIgnoreList = params.teamsToIgnore.split(',').map(t => t.trim());
 
-        let all_tasks_with_teams = preparedTasks.map(row => ({...row}));
+        // <-- FIX: Use the tasks with overrides applied
+        let all_tasks_with_teams = tasksWithOverrides.map(row => ({...row}));
         all_tasks_with_teams = assignTeams(all_tasks_with_teams, teamMapping);
 
         const skuValueMap = all_tasks_with_teams.reduce((acc, task) => {
@@ -667,9 +661,11 @@ app.post('/api/schedule', async (req, res) => {
         error: null,
     };
 
+    // <-- FIX: Destructure the new override objects from the request body
     const { 
         projectTasks, params, teamDefs, ptoEntries, teamMemberChanges,
-        workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap
+        workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
+        startDateOverrides, endDateOverrides 
     } = req.body;
 
     if (!projectTasks || !params || !teamDefs) {
@@ -678,10 +674,8 @@ app.post('/api/schedule', async (req, res) => {
         return res.status(400).json({ error: jobs[jobId].error });
     }
     
-    // Respond immediately to the client
     res.status(202).json({ jobId });
 
-    // --- Start the long-running task in the background ---
     (async () => {
         try {
             const updateProgress = (progress, message, step) => {
@@ -712,9 +706,12 @@ app.post('/api/schedule', async (req, res) => {
             }
 
             updateProgress(15, 'Starting scheduling simulation...', 'simulating');
+            
+            // <-- FIX: Pass the override objects to the scheduling engine
             const results = await runSchedulingEngine(
                 preparedTasks, params, teamDefs, ptoEntries, teamMemberChanges,
                 workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
+                startDateOverrides, endDateOverrides, // Pass them here
                 updateProgress
             );
             
@@ -751,10 +748,6 @@ app.get('/api/schedule/status/:jobId', (req, res) => {
 const startServer = async () => {
     await loadMasterRoutingData();
     
-    // --- MODIFIED ---
-    // We no longer try a persistent connect() on startup.
-    // Instead, we run a simple test query using the pool.
-    // This confirms credentials are correct but doesn't stop the server from starting if Snowflake is temporarily down.
     console.log("Testing Snowflake pool connection...");
     try {
         await snowflakePool.use(async (connection) => {
