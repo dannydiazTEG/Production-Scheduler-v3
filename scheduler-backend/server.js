@@ -1,7 +1,7 @@
 // server.js
 // This is the backend server for your Production Scheduling Engine.
 // It now includes logic for Snowflake integration and asynchronous job processing.
-// --- VERSION 3.1: Patched to handle date overrides from the frontend ---
+// --- VERSION 3.2: Added LagAfterHours logic for process sit/dry time ---
 
 if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
@@ -70,14 +70,18 @@ async function loadMasterRoutingData() {
             if (!projectType) continue;
             if (!groupedData[projectType]) groupedData[projectType] = [];
             
+            // --- MODIFIED SECTION ---
+            // Added LagAfterHours to the data loading logic.
             groupedData[projectType].push({
                 "Operation": row.Operation,
                 "Estimated Hours": parseFloat(row['Estimated Hours']),
                 "Order": parseInt(row.Order, 10),
                 "SKU": row.SKU,
                 "SKU Name": row['SKU Name'],
-                "Value": parseFloat(row.Value)
+                "Value": parseFloat(row.Value),
+                "LagAfterHours": parseFloat(row.LagAfterHours) || 0
             });
+            // --- END MODIFICATION ---
         }
         
         for(const projectType in groupedData) {
@@ -209,17 +213,15 @@ async function prepareProjectData(projectTasks, updateProgress) {
 const runSchedulingEngine = async (
     preparedTasks, params, teamDefs, ptoEntries, teamMemberChanges,
     workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
-    startDateOverrides, endDateOverrides, // <-- FIX: Added parameters
+    startDateOverrides, endDateOverrides,
     updateProgress 
 ) => {
     const logs = [];
     let error = '';
 
-    // <-- FIX: Apply date overrides at the beginning of the simulation
     const tasksWithOverrides = preparedTasks.map(task => {
         const newStartDate = startDateOverrides[task.Project];
         const newDueDate = endDateOverrides[task.Project];
-        // Only apply the override if it exists, otherwise keep the original date.
         if (newStartDate) task.StartDate = newStartDate;
         if (newDueDate) task.DueDate = newDueDate;
         return task;
@@ -262,7 +264,6 @@ const runSchedulingEngine = async (
         let teamHeadcounts = teamDefs.headcounts.reduce((acc, t) => ({...acc, [t.name]: t.count}), {});
         const teamsToIgnoreList = params.teamsToIgnore.split(',').map(t => t.trim());
 
-        // <-- FIX: Use the tasks with overrides applied
         let all_tasks_with_teams = tasksWithOverrides.map(row => ({...row}));
         all_tasks_with_teams = assignTeams(all_tasks_with_teams, teamMapping);
 
@@ -343,13 +344,42 @@ const runSchedulingEngine = async (
                 continue;
             }
             
+            // --- MODIFIED SECTION ---
+            // Replaced the original isReady function with one that understands LagAfterHours.
             const isReady = (task) => {
                 if (current_date < task.StartDate) return false;
+
                 const key = `${task.Project}|${task.SKU}`;
                 const allSkuTasks = schedulableTasksMap.get(key) || [];
                 const predecessors = allSkuTasks.filter(t => t.Order < task.Order);
-                return predecessors.every(p => completed_operations.some(c => c.TaskID === p.TaskID));
+
+                if (predecessors.length === 0) {
+                    return true; // First operation is always ready if after start date
+                }
+
+                return predecessors.every(p => {
+                    const completedPredecessor = completed_operations.find(c => c.TaskID === p.TaskID);
+                    if (!completedPredecessor) {
+                        return false; // Predecessor isn't done yet
+                    }
+
+                    // Predecessor is done, now check for lag time.
+                    const lagHours = p.LagAfterHours || 0;
+                    if (lagHours === 0) {
+                        return true; // No lag, so it's ready
+                    }
+                    
+                    const hoursPerWorkDay = parseFloat(params.hoursPerDay) || 8;
+                    const lagInDays = lagHours / hoursPerWorkDay;
+                    
+                    const completionDate = new Date(completedPredecessor.CompletionDate);
+                    const readyDate = new Date(completionDate.getTime());
+                    readyDate.setDate(readyDate.getDate() + Math.ceil(lagInDays));
+
+                    return current_date >= readyDate;
+                });
             };
+            // --- END MODIFICATION ---
 
             const ready_tasks_for_dwelling_check = unscheduled_tasks.filter(isReady);
             const dwellingHoursToday = {};
@@ -474,10 +504,10 @@ const runSchedulingEngine = async (
                 }
                 unscheduled_tasks = unscheduled_tasks.filter(t => t.HoursRemaining > 0.01);
             }
-            if (loopCounter % 5 === 0) { // Update progress every 5 simulated days
+            if (loopCounter % 5 === 0) {
                 const progress = 15 + Math.round((totalHoursCompleted / totalWorkloadHours) * 75);
                 updateProgress(progress, `Simulating Day ${loopCounter + 1}...`);
-                await yieldToEventLoop(); // Allow other requests to be processed
+                await yieldToEventLoop();
             }
 
             current_date.setDate(current_date.getDate() + 1);
@@ -661,7 +691,6 @@ app.post('/api/schedule', async (req, res) => {
         error: null,
     };
 
-    // <-- FIX: Destructure the new override objects from the request body
     const { 
         projectTasks, params, teamDefs, ptoEntries, teamMemberChanges,
         workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
@@ -707,11 +736,10 @@ app.post('/api/schedule', async (req, res) => {
 
             updateProgress(15, 'Starting scheduling simulation...', 'simulating');
             
-            // <-- FIX: Pass the override objects to the scheduling engine
             const results = await runSchedulingEngine(
                 preparedTasks, params, teamDefs, ptoEntries, teamMemberChanges,
                 workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
-                startDateOverrides, endDateOverrides, // Pass them here
+                startDateOverrides, endDateOverrides,
                 updateProgress
             );
             
