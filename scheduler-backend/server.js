@@ -676,7 +676,353 @@ const runSchedulingEngine = async (
         return { error: `A critical error occurred on the server: ${e.message}`, logs };
     }
 };
+// --- Resource Optimization Algorithm ---
+const optimizeResources = async (
+    projectTasks, params, teamDefs, ptoEntries, teamMemberChanges,
+    workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
+    startDateOverrides, endDateOverrides, optimizationConfig, updateProgress
+) => {
+    const logs = [];
+    logs.push("--- Starting Resource Optimization ---");
+    
+    const {
+        targetDeadlineBuffer = 0, // Days of buffer before due date (positive = early)
+        maxIterations = 20,
+        budgetLimit = Infinity,
+        minHeadcount = {},
+        maxHeadcount = {},
+        allowHiring = true,
+        allowOvertime = false,
+        maxOvertimeHours = 2,
+        costPerHour = 25, // Base hourly rate
+        overtimeMultiplier = 1.5,
+    } = optimizationConfig;
 
+    let currentTeamDefs = JSON.parse(JSON.stringify(teamDefs)); // Deep copy
+    let iteration = 0;
+    let bestSolution = null;
+    let bestCost = Infinity;
+    let totalAdditionalCost = 0;
+    
+    const originalHeadcounts = {};
+    teamDefs.headcounts.forEach(t => {
+        originalHeadcounts[t.name] = t.count;
+    });
+
+    const allChanges = [];
+
+    while (iteration < maxIterations) {
+        logs.push(`\n--- Iteration ${iteration + 1} ---`);
+        updateProgress(
+            10 + Math.round((iteration / maxIterations) * 80),
+            `Optimization iteration ${iteration + 1} of ${maxIterations}...`,
+            'optimizing'
+        );
+
+        // Run scheduler with current resource configuration
+        const { tasks: preparedTasks } = await prepareProjectData(projectTasks, () => {});
+        
+        const results = await runSchedulingEngine(
+            preparedTasks, params, currentTeamDefs, ptoEntries, teamMemberChanges,
+            workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
+            startDateOverrides, endDateOverrides,
+            () => {} // Silent progress updates during optimization
+        );
+
+        if (results.error) {
+            logs.push(`Iteration ${iteration + 1} failed: ${results.error}`);
+            break;
+        }
+
+        // Analyze results - check if all projects meet target deadlines
+        const gaps = [];
+        results.projectSummary.forEach(project => {
+            const finishDate = parseDate(project.FinishDate);
+            const targetDueDate = parseDate(endDateOverrides[project.Project] || project.DueDate);
+            
+            if (!finishDate || !targetDueDate) return;
+            
+            // Calculate days difference (negative = late)
+            const daysFromTarget = Math.round((targetDueDate.getTime() - finishDate.getTime()) / (1000 * 60 * 60 * 24));
+            const requiredBuffer = targetDeadlineBuffer;
+            
+            if (daysFromTarget < requiredBuffer) {
+                const daysLate = requiredBuffer - daysFromTarget;
+                gaps.push({
+                    project: project.Project,
+                    daysLate: daysLate,
+                    finishDate: project.FinishDate,
+                    targetDate: project.DueDate
+                });
+            }
+        });
+
+        // Check if we've achieved the goal
+        if (gaps.length === 0) {
+            logs.push(`✓ SUCCESS: All projects meet target deadlines with ${targetDeadlineBuffer}-day buffer!`);
+            bestSolution = {
+                teamDefs: currentTeamDefs,
+                schedule: results,
+                gaps: [],
+                changes: allChanges,
+                totalCost: totalAdditionalCost,
+                iterations: iteration + 1
+            };
+            break;
+        }
+
+        logs.push(`Found ${gaps.length} projects missing target deadline:`);
+        gaps.forEach(gap => {
+            logs.push(`  - ${gap.project}: ${gap.daysLate} days late`);
+        });
+
+        // Identify bottleneck teams from workload data
+        const bottleneckTeams = identifyBottlenecks(results.teamWorkload, results.teamUtilization);
+        logs.push(`Identified bottleneck teams: ${bottleneckTeams.map(b => `${b.team} (${b.severity.toFixed(0)}% overload)`).join(', ')}`);
+
+        if (bottleneckTeams.length === 0) {
+            logs.push("No clear bottlenecks identified. Optimization cannot proceed further.");
+            break;
+        }
+
+        // Propose and apply adjustments
+        const adjustment = proposeAdjustment(
+            bottleneckTeams,
+            currentTeamDefs,
+            { allowHiring, allowOvertime, maxOvertimeHours, minHeadcount, maxHeadcount, costPerHour, budgetLimit: budgetLimit - totalAdditionalCost }
+        );
+
+        if (!adjustment) {
+            logs.push("No viable adjustments available within constraints.");
+            break;
+        }
+
+        logs.push(`Applying adjustment: ${adjustment.description}`);
+        currentTeamDefs = applyAdjustment(currentTeamDefs, adjustment);
+        allChanges.push(adjustment);
+        totalAdditionalCost += adjustment.cost;
+
+        // Store this as best solution so far if it improved
+        if (gaps.length < (bestSolution?.gaps.length || Infinity)) {
+            bestSolution = {
+                teamDefs: currentTeamDefs,
+                schedule: results,
+                gaps: gaps,
+                changes: allChanges,
+                totalCost: totalAdditionalCost,
+                iterations: iteration + 1
+            };
+            bestCost = totalAdditionalCost;
+        }
+
+        iteration++;
+    }
+
+    if (!bestSolution) {
+        return {
+            success: false,
+            error: "Could not find a viable solution within constraints.",
+            logs
+        };
+    }
+
+    const finalResult = {
+        success: bestSolution.gaps.length === 0,
+        optimizedTeamDefs: bestSolution.teamDefs,
+        schedule: bestSolution.schedule,
+        changes: bestSolution.changes,
+        totalCost: bestSolution.totalCost,
+        iterations: bestSolution.iterations,
+        remainingGaps: bestSolution.gaps,
+        logs
+    };
+
+    updateProgress(95, 'Optimization complete!', 'finalizing');
+    return finalResult;
+};
+
+// Helper: Identify bottleneck teams from workload data
+function identifyBottlenecks(teamWorkload, teamUtilization) {
+    const bottlenecks = [];
+    const teamOverloadScores = {};
+
+    // Analyze workload ratios (demand vs capacity)
+    teamWorkload.forEach(weekData => {
+        weekData.teams.forEach(team => {
+            if (!teamOverloadScores[team.name]) {
+                teamOverloadScores[team.name] = { totalOverload: 0, weeks: 0, maxRatio: 0 };
+            }
+            if (team.workloadRatio > 100) {
+                const overload = team.workloadRatio - 100;
+                teamOverloadScores[team.name].totalOverload += overload;
+                teamOverloadScores[team.name].weeks++;
+                teamOverloadScores[team.name].maxRatio = Math.max(teamOverloadScores[team.name].maxRatio, team.workloadRatio);
+            }
+        });
+    });
+
+    // Analyze utilization (actual work done vs capacity)
+    teamUtilization.forEach(weekData => {
+        weekData.teams.forEach(team => {
+            const utilization = parseFloat(team.utilization);
+            if (utilization > 95) {
+                if (!teamOverloadScores[team.name]) {
+                    teamOverloadScores[team.name] = { totalOverload: 0, weeks: 0, maxRatio: 0 };
+                }
+                // High utilization suggests this team is running at capacity
+                teamOverloadScores[team.name].totalOverload += (utilization - 95) * 2; // Weight high utilization
+                teamOverloadScores[team.name].weeks++;
+            }
+        });
+    });
+
+    // Sort teams by severity
+    const sortedTeams = Object.entries(teamOverloadScores)
+        .map(([team, data]) => ({
+            team,
+            severity: data.totalOverload / Math.max(data.weeks, 1),
+            weeksOverloaded: data.weeks,
+            maxRatio: data.maxRatio
+        }))
+        .filter(t => t.severity > 5) // Only significant bottlenecks
+        .sort((a, b) => b.severity - a.severity);
+
+    return sortedTeams.slice(0, 3); // Top 3 bottlenecks
+}
+
+// Helper: Propose the best adjustment
+function proposeAdjustment(bottleneckTeams, currentTeamDefs, constraints) {
+    const { allowHiring, minHeadcount, maxHeadcount, costPerHour, budgetLimit } = constraints;
+
+    if (!allowHiring || bottleneckTeams.length === 0) return null;
+
+    // Focus on the worst bottleneck
+    const worstBottleneck = bottleneckTeams[0];
+    const teamName = worstBottleneck.team;
+    
+    const currentTeam = currentTeamDefs.headcounts.find(t => t.name === teamName);
+    if (!currentTeam) return null;
+
+    const currentCount = currentTeam.count;
+    const maxAllowed = maxHeadcount[teamName] || currentCount + 10;
+    const minAllowed = minHeadcount[teamName] || currentCount;
+
+    if (currentCount >= maxAllowed) {
+        return null; // Already at max
+    }
+
+    // Calculate how many people to add based on severity
+    // Rule of thumb: For every 50% overload, add 1 person
+    const increaseNeeded = Math.max(0.5, Math.ceil(worstBottleneck.severity / 50));
+    const proposedIncrease = Math.min(increaseNeeded, maxAllowed - currentCount);
+
+    if (proposedIncrease < 0.5) return null;
+
+    // Estimate cost (simplified: assume 40 hours/week * 52 weeks * hourly rate / 52 weeks = weekly cost)
+    const weeklyCost = proposedIncrease * 40 * costPerHour;
+    const totalCost = weeklyCost * worstBottleneck.weeksOverloaded;
+
+    if (totalCost > budgetLimit) {
+        // Try to fit within budget
+        const affordableIncrease = Math.floor(budgetLimit / (40 * costPerHour * worstBottleneck.weeksOverloaded));
+        if (affordableIncrease < 0.5) return null;
+        
+        return {
+            type: 'hire',
+            team: teamName,
+            amount: affordableIncrease,
+            cost: affordableIncrease * 40 * costPerHour * worstBottleneck.weeksOverloaded,
+            description: `Add ${affordableIncrease} team member(s) to ${teamName} (budget-limited)`,
+            estimatedImpact: `Reduces ${teamName} overload by ~${(affordableIncrease * 50).toFixed(0)}%`
+        };
+    }
+
+    return {
+        type: 'hire',
+        team: teamName,
+        amount: proposedIncrease,
+        cost: totalCost,
+        description: `Add ${proposedIncrease} team member(s) to ${teamName}`,
+        estimatedImpact: `Reduces ${teamName} overload by ~${(proposedIncrease * 50).toFixed(0)}%`
+    };
+}
+
+// Helper: Apply adjustment to team definitions
+function applyAdjustment(teamDefs, adjustment) {
+    const newTeamDefs = JSON.parse(JSON.stringify(teamDefs)); // Deep copy
+    
+    if (adjustment.type === 'hire') {
+        const team = newTeamDefs.headcounts.find(t => t.name === adjustment.team);
+        if (team) {
+            team.count += adjustment.amount;
+        }
+    }
+    
+    return newTeamDefs;
+}
+
+// --- NEW API ENDPOINT: Optimize Resources ---
+app.post('/api/optimize', async (req, res) => {
+    console.log('Received request to /api/optimize to start optimization job.');
+    const jobId = uuidv4();
+    
+    jobs[jobId] = {
+        status: 'pending',
+        progress: 0,
+        message: 'Optimization job is queued...',
+        step: 'starting',
+        result: null,
+        error: null,
+    };
+
+    const { 
+        projectTasks, params, teamDefs, ptoEntries, teamMemberChanges,
+        workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
+        startDateOverrides, endDateOverrides, optimizationConfig
+    } = req.body;
+
+    if (!projectTasks || !params || !teamDefs || !optimizationConfig) {
+        jobs[jobId].status = 'error';
+        jobs[jobId].error = 'Missing required data from frontend.';
+        return res.status(400).json({ error: jobs[jobId].error });
+    }
+    
+    res.status(202).json({ jobId });
+
+    (async () => {
+        try {
+            const updateProgress = (progress, message, step) => {
+                if (jobs[jobId]) {
+                    jobs[jobId].progress = progress;
+                    jobs[jobId].message = message;
+                    if (step) jobs[jobId].step = step;
+                }
+            };
+
+            jobs[jobId].status = 'running';
+            updateProgress(5, 'Starting resource optimization...', 'preparing');
+            
+            const results = await optimizeResources(
+                projectTasks, params, teamDefs, ptoEntries, teamMemberChanges,
+                workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
+                startDateOverrides, endDateOverrides, optimizationConfig,
+                updateProgress
+            );
+            
+            jobs[jobId].status = 'complete';
+            jobs[jobId].progress = 100;
+            jobs[jobId].message = results.success ? 'Optimization complete!' : 'Optimization finished with partial solution';
+            jobs[jobId].step = 'done';
+            jobs[jobId].result = results;
+
+        } catch (e) {
+            console.error(`[Job ${jobId}] Failed to run optimization:`, e);
+            jobs[jobId].status = 'error';
+            jobs[jobId].error = 'An internal server error occurred during optimization.';
+            jobs[jobId].result = { details: e.message };
+        }
+    })();
+});
 // --- API Endpoints ---
 app.post('/api/schedule', async (req, res) => {
     console.log('Received request to /api/schedule to start a new job.');
