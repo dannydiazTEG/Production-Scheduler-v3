@@ -241,6 +241,7 @@ const runSchedulingEngine = async (
             // Check if operation name contains "kitting" (case-insensitive)
             const operationLower = (row.Operation || '').toLowerCase();
             if (operationLower.includes('kitting')) {
+                logs.push(`DEBUG: Found kitting operation "${row.Operation}" - assigning to Receiving team`);
                 return { ...row, Team: 'Receiving' };
             }
             return { ...row, Team: teamMap[row.Operation] || 'Unassigned' };
@@ -732,6 +733,8 @@ const runSchedulingEngine = async (
 
         const projectSummary = Object.values(projectSummaryMap).map(p => ({...p, StartDate: formatDate(p.StartDate), FinishDate: formatDate(p.FinishDate), DueDate: formatDate(p.DueDate) }));
         const finalSchedule = daily_log_entries.map(log => ({...log, StartDate: formatDate(log.StartDate), DueDate: formatDate(log.DueDate)}));
+        const kittingEntriesCount = finalSchedule.filter(log => log.Operation && log.Operation.toLowerCase().includes('kitting')).length;
+        logs.push(`DEBUG: Final schedule contains ${kittingEntriesCount} kitting operation entries out of ${finalSchedule.length} total entries`);
         const projectedCompletion = projectSummary.length > 0 ? formatDate(projectSummary.reduce((max, p) => p.FinishDate > max ? p.FinishDate : max, new Date(0))) : null;
 
         const dailyCompletions = finalCompletions.map(item => ({ Date: formatDate(item.completionDate), Job: item.Project, Store: item.Store, SKU: item.SKU, 'SKU Name': item['SKU Name'], Value: item.value })).sort((a,b) => new Date(a.Date) - new Date(b.Date));
