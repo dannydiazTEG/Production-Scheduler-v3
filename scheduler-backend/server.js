@@ -48,7 +48,8 @@ app.use(express.urlencoded({ limit: '100mb', extended: true }));
 const jobs = {};
 
 // --- CONSTANTS ---
-const TEAM_SORT_ORDER = ['CNC', 'Metal', 'Scenic', 'Paint', 'Carpentry', 'Assembly', 'Tech', 'Hybrid'];
+// UPDATED: Added 'Receiving' (start of flow) and 'QC' (end of flow) to sort order
+const TEAM_SORT_ORDER = ['Receiving', 'CNC', 'Metal', 'Scenic', 'Paint', 'Carpentry', 'Assembly', 'Tech', 'QC', 'Hybrid'];
 
 // =================================================================
 // --- MASTER ROUTING DATA FROM GOOGLE SHEETS ---
@@ -3028,4 +3029,4 @@ const startServer = async () => {
     });
 };
 
-startServer(); 
+startServer();
