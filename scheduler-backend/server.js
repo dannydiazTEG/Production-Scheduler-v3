@@ -32,15 +32,33 @@ const allowedOrigins = [
 
 const corsOptions = {
   origin: function (origin, callback) {
+    // Log all CORS checks for debugging
+    console.log(`CORS Check: Origin="${origin}"`);
     if (!origin || allowedOrigins.some(allowed => typeof allowed === 'string' ? allowed === origin : allowed.test(origin))) {
+      console.log(`CORS Check: Origin ${origin || 'null'} is ALLOWED`);
       return callback(null, true);
     } else {
       console.error(`CORS Check: Origin ${origin} is NOT allowed.`);
       return callback(new Error('Not allowed by CORS'));
     }
-  }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  exposedHeaders: ['Content-Range', 'X-Content-Range'],
+  maxAge: 600 // Cache preflight for 10 minutes
 };
 app.use(cors(corsOptions));
+
+// Handle OPTIONS preflight requests explicitly
+// Note: cors middleware already handles OPTIONS automatically
+
+// Request logging middleware
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path} - Origin: ${req.headers.origin || 'none'}`);
+  next();
+});
+
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
@@ -3061,6 +3079,18 @@ app.get('/api/schedule/status/:jobId', (req, res) => {
     res.json(job);
 });
 
+// Catch-all error handler for Express (must be after all routes)
+app.use((err, req, res, next) => {
+    console.error('Express Error Handler:', err);
+    if (res.headersSent) {
+        return next(err);
+    }
+    res.status(500).json({
+        error: 'Internal Server Error',
+        message: err.message,
+        path: req.path
+    });
+});
 
 // --- Start Server ---
 const startServer = async () => {
@@ -3080,5 +3110,18 @@ const startServer = async () => {
         console.log(`SERVER IS LIVE AND LISTENING ON ALL INTERFACES - Port: ${port}`);
     });
 };
+
+// Global error handlers
+process.on('uncaughtException', (error) => {
+    console.error('UNCAUGHT EXCEPTION:', error);
+    console.error('Stack:', error.stack);
+    // Don't exit - let the server keep running
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('UNHANDLED REJECTION at:', promise);
+    console.error('Reason:', reason);
+    // Don't exit - let the server keep running
+});
 
 startServer();
