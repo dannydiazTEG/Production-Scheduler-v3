@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: production-scheduler-backend
+    env: node
+    buildCommand: cd scheduler-backend && npm install
+    startCommand: cd scheduler-backend && npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+    # Increase timeout to 5 minutes for long-running schedules
+    healthCheckPath: /
+    # Set higher limits for memory and CPU

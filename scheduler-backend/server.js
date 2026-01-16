@@ -130,8 +130,12 @@ async function loadMasterRoutingData() {
 
     } catch (error) {
         console.error(`Failed to load master routing data: ${error.message}`);
-        console.error("CRITICAL: The server will shut down. Please fix the MASTER_ROUTING_URL or your network connection.");
-        process.exit(1);
+        console.error("WARNING: Server will continue running, but project builder may not work until routing data loads.");
+        // Retry after 30 seconds
+        setTimeout(() => {
+            console.log("Retrying to load master routing data...");
+            loadMasterRoutingData();
+        }, 30000);
     }
 }
 
@@ -2942,6 +2946,26 @@ app.post('/api/optimize', async (req, res) => {
         }
     })();
 });
+// --- Health Check Endpoints ---
+app.get('/', (req, res) => {
+    res.json({
+        status: 'ok',
+        service: 'Production Scheduler Backend',
+        version: '2.0',
+        uptime: process.uptime(),
+        activeJobs: Object.keys(jobs).length
+    });
+});
+
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        memory: process.memoryUsage(),
+        activeJobs: Object.keys(jobs).length
+    });
+});
+
 // --- API Endpoints ---
 app.post('/api/schedule', async (req, res) => {
     console.log('Received request to /api/schedule to start a new job.');
