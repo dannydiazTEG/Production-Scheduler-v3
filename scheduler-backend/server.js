@@ -47,6 +47,34 @@ app.use(express.urlencoded({ limit: '100mb', extended: true }));
 // --- In-memory store for async jobs ---
 const jobs = {};
 
+// --- JOB CLEANUP TO PREVENT MEMORY LEAKS ---
+// Automatically removes completed jobs older than 1 hour
+const JOB_RETENTION_MS = 60 * 60 * 1000; // 1 hour
+const CLEANUP_INTERVAL_MS = 10 * 60 * 1000; // Run cleanup every 10 minutes
+
+function cleanupOldJobs() {
+    const now = Date.now();
+    let removedCount = 0;
+
+    for (const jobId in jobs) {
+        const job = jobs[jobId];
+        // Remove jobs that are complete or errored AND older than retention period
+        if ((job.status === 'complete' || job.status === 'error') &&
+            job.createdAt && (now - job.createdAt > JOB_RETENTION_MS)) {
+            delete jobs[jobId];
+            removedCount++;
+        }
+    }
+
+    if (removedCount > 0) {
+        console.log(`Cleaned up ${removedCount} old jobs. Active jobs remaining: ${Object.keys(jobs).length}`);
+    }
+}
+
+// Start periodic cleanup
+setInterval(cleanupOldJobs, CLEANUP_INTERVAL_MS);
+console.log('Job cleanup service started. Will run every 10 minutes to remove jobs older than 1 hour.');
+
 // --- CONSTANTS ---
 // UPDATED: Added 'Receiving' (start of flow) and 'QC' (end of flow) to sort order
 const TEAM_SORT_ORDER = ['Receiving', 'CNC', 'Metal', 'Scenic', 'Paint', 'Carpentry', 'Assembly', 'Tech', 'QC', 'Hybrid'];
@@ -2799,6 +2827,7 @@ app.post('/api/scenarios', async (req, res) => {
         step: 'starting',
         result: null,
         error: null,
+        createdAt: Date.now(),
     };
 
     const {
@@ -2854,7 +2883,7 @@ app.post('/api/scenarios', async (req, res) => {
 app.post('/api/optimize', async (req, res) => {
     console.log('Received request to /api/optimize to start optimization job.');
     const jobId = uuidv4();
-    
+
     jobs[jobId] = {
         status: 'pending',
         progress: 0,
@@ -2862,6 +2891,7 @@ app.post('/api/optimize', async (req, res) => {
         step: 'starting',
         result: null,
         error: null,
+        createdAt: Date.now(),
     };
 
     const { 
@@ -2916,7 +2946,7 @@ app.post('/api/optimize', async (req, res) => {
 app.post('/api/schedule', async (req, res) => {
     console.log('Received request to /api/schedule to start a new job.');
     const jobId = uuidv4();
-    
+
     jobs[jobId] = {
         status: 'pending',
         progress: 0,
@@ -2924,6 +2954,7 @@ app.post('/api/schedule', async (req, res) => {
         step: 'starting',
         result: null,
         error: null,
+        createdAt: Date.now(),
     };
 
     const { 
