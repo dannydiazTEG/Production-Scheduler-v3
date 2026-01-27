@@ -415,14 +415,12 @@ const runSchedulingEngine = async (
         // =========================================================
         // START NEW LOGIC: Global Transition Buffer
         // =========================================================
-        const GLOBAL_BUFFER_PERCENT = 0.15; // 15% of task duration
+        const globalBufferPercent = (parseFloat(params.globalBuffer) || 0) / 100;
 
         operations_df.forEach(task => {
-            // Calculate buffer based on estimated hours
-            let calculatedBuffer = task['Estimated Hours'] * GLOBAL_BUFFER_PERCENT;
-            
-            // Assign to LagAfterHours (Overrides Sheet data)
-            task.LagAfterHours = calculatedBuffer;
+        // Calculate buffer dynamically
+        let calculatedBuffer = task['Estimated Hours'] * globalBufferPercent;
+        task.LagAfterHours = calculatedBuffer;
         });
         // =========================================================
         // END NEW LOGIC
