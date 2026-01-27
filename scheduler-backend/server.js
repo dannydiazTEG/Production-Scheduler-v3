@@ -412,6 +412,21 @@ const runSchedulingEngine = async (
 
         operations_df = operations_df.map((row, index) => ({...row, TaskID: index, HoursRemaining: row['Estimated Hours'], AssignedTo: null }))
             .sort((a,b) => (a.Project || '').localeCompare(b.Project || '') || (a.SKU || '').localeCompare(b.SKU || '') || a.Order - b.Order);
+        // =========================================================
+        // START NEW LOGIC: Global Transition Buffer
+        // =========================================================
+        const GLOBAL_BUFFER_PERCENT = 0.15; // 15% of task duration
+
+        operations_df.forEach(task => {
+            // Calculate buffer based on estimated hours
+            let calculatedBuffer = task['Estimated Hours'] * GLOBAL_BUFFER_PERCENT;
+            
+            // Assign to LagAfterHours (Overrides Sheet data)
+            task.LagAfterHours = calculatedBuffer;
+        });
+        // =========================================================
+        // END NEW LOGIC
+        // =========================================================
 
         const schedulableTasksMap = new Map();
         operations_df.forEach(task => {
