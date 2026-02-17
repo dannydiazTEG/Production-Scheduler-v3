@@ -12,6 +12,7 @@ const cors = require('cors');
 const snowflake = require('snowflake-sdk');
 const fetch = require('node-fetch');
 const { v4: uuidv4 } = require('uuid'); // To generate unique job IDs
+const { runEarliestDueDateEngine, runCriticalPathEngine, runWorkLevelingEngine, runBottleneckFirstEngine } = require('./scheduling-strategies');
 
 // --- Setup ---
 const app = express();
@@ -3090,6 +3091,131 @@ app.get('/api/schedule/status/:jobId', (req, res) => {
     }
 
     res.json(job);
+});
+
+// --- Algorithm Comparison Endpoint ---
+// Runs the same inputs through multiple scheduling strategies and returns all results.
+// The 'baseline' strategy calls the EXISTING runSchedulingEngine (untouched).
+// Other strategies call functions from scheduling-strategies.js.
+const STRATEGY_ENGINES = {
+    'baseline': runSchedulingEngine,
+    'earliest-due-date': runEarliestDueDateEngine,
+    'critical-path': runCriticalPathEngine,
+    'work-leveling': runWorkLevelingEngine,
+    'bottleneck-first': runBottleneckFirstEngine,
+};
+
+app.post('/api/schedule/compare', async (req, res) => {
+    console.log('Received request to /api/schedule/compare to start a comparison job.');
+    const jobId = uuidv4();
+
+    jobs[jobId] = {
+        status: 'pending',
+        progress: 0,
+        message: 'Comparison job is queued...',
+        step: 'starting',
+        result: null,
+        error: null,
+        createdAt: Date.now(),
+    };
+
+    const {
+        projectTasks, params, teamDefs, ptoEntries, teamMemberChanges,
+        workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
+        startDateOverrides, endDateOverrides,
+        algorithms
+    } = req.body;
+
+    if (!projectTasks || !params || !teamDefs) {
+        jobs[jobId].status = 'error';
+        jobs[jobId].error = 'Missing required data from frontend.';
+        return res.status(400).json({ error: jobs[jobId].error });
+    }
+
+    const selectedAlgorithms = (algorithms && algorithms.length > 0)
+        ? algorithms.filter(a => STRATEGY_ENGINES[a])
+        : ['baseline'];
+
+    if (selectedAlgorithms.length === 0) {
+        jobs[jobId].status = 'error';
+        jobs[jobId].error = 'No valid algorithms specified.';
+        return res.status(400).json({ error: jobs[jobId].error });
+    }
+
+    res.status(202).json({ jobId });
+
+    (async () => {
+        try {
+            const updateProgress = (progress, message, step) => {
+                if (jobs[jobId]) {
+                    jobs[jobId].progress = progress;
+                    jobs[jobId].message = message;
+                    if (step) jobs[jobId].step = step;
+                }
+            };
+
+            jobs[jobId].status = 'running';
+            updateProgress(0, 'Preparing project data...', 'preparing');
+
+            const { tasks: preparedTasks, logs: prepLogs, completedTasks } = await prepareProjectData(projectTasks, updateProgress);
+
+            if (preparedTasks.length === 0) {
+                const combinedLogs = [...prepLogs, "All tasks for the submitted projects are already complete."];
+                jobs[jobId].status = 'complete';
+                jobs[jobId].progress = 100;
+                jobs[jobId].message = 'All tasks were already completed.';
+                jobs[jobId].step = 'done';
+                const emptyResult = {
+                    finalSchedule: [], projectSummary: [], teamUtilization: [], weeklyOutput: [],
+                    dailyCompletions: [], teamWorkload: [], recommendations: [],
+                    projectedCompletion: null, logs: combinedLogs, completedTasks, error: ''
+                };
+                const comparisonResults = {};
+                selectedAlgorithms.forEach(algo => { comparisonResults[algo] = emptyResult; });
+                jobs[jobId].result = { comparisonResults, algorithms: selectedAlgorithms, completedTasks };
+                return;
+            }
+
+            const comparisonResults = {};
+            const totalAlgorithms = selectedAlgorithms.length;
+
+            for (let i = 0; i < totalAlgorithms; i++) {
+                const algoName = selectedAlgorithms[i];
+                const engineFn = STRATEGY_ENGINES[algoName];
+                const algoProgress = (progress, message) => {
+                    const overallProgress = Math.round(((i / totalAlgorithms) + (progress / 100 / totalAlgorithms)) * 100);
+                    updateProgress(overallProgress, `[${algoName}] ${message}`, 'simulating');
+                };
+
+                algoProgress(0, `Starting ${algoName} simulation...`);
+
+                // Deep copy the prepared tasks so each engine gets fresh data
+                const tasksCopy = JSON.parse(JSON.stringify(preparedTasks));
+
+                const results = await engineFn(
+                    tasksCopy, params, teamDefs, ptoEntries, teamMemberChanges,
+                    workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
+                    startDateOverrides || {}, endDateOverrides || {},
+                    algoProgress
+                );
+
+                const combinedLogs = [...prepLogs, ...(results.logs || [])];
+                comparisonResults[algoName] = { ...results, logs: combinedLogs };
+            }
+
+            jobs[jobId].status = 'complete';
+            jobs[jobId].progress = 100;
+            jobs[jobId].message = 'Comparison complete!';
+            jobs[jobId].step = 'done';
+            jobs[jobId].result = { comparisonResults, algorithms: selectedAlgorithms, completedTasks };
+
+        } catch (e) {
+            console.error(`[Job ${jobId}] Failed to run comparison:`, e);
+            jobs[jobId].status = 'error';
+            jobs[jobId].error = 'An internal server error occurred during comparison.';
+            jobs[jobId].result = { details: e.message };
+        }
+    })();
 });
 
 // Catch-all error handler for Express (must be after all routes)
