@@ -2532,11 +2532,12 @@ const runBottleneckFirstEngine = async (
                                 if (continuation_task) {
                                     task_to_assign = continuation_task;
                                 } else {
-                                    let new_task = team_ready_tasks.find(t => !t.AssignedTo && !skus_being_worked_on_today.has(t.SKU));
-                                    if (!new_task) new_task = team_ready_tasks.find(t => !t.AssignedTo);
-                                    if (new_task) {
                                     // Relaxed SKU spreading: top 20% priority tasks can double up on SKUs
                                     let new_task = team_ready_tasks.find(t => !t.AssignedTo && (!skus_being_worked_on_today.has(t.SKU) || t.DynamicPriority >= topPriorityThreshold));
+                                    if (!new_task) new_task = team_ready_tasks.find(t => !t.AssignedTo);
+                                    if (new_task) {
+                                        task_to_assign = new_task;
+                                        unscheduled_tasks.find(t => t.TaskID === task_to_assign.TaskID).AssignedTo = member.TeamMember;
                                     }
                                 }
                                 if (task_to_assign) {
