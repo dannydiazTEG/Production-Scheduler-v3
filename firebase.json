@@ -1,6 +1,6 @@
 {
   "hosting": {
-    "public": "scheduler-frontend/build",
+    "public": "build",  // <--- Changed from "scheduler-frontend/build"
     "ignore": [
       "firebase.json",
       "**/.*",

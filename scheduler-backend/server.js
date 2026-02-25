@@ -134,7 +134,8 @@ async function loadMasterRoutingData() {
                 "SKU": row.SKU,
                 "SKU Name": row['SKU Name'],
                 "Value": parseFloat(row.Value),
-                "LagAfterHours": parseFloat(row.LagAfterHours) || 0
+                "LagAfterHours": parseFloat(row.LagAfterHours) || 0,
+                "AssemblyGroup": row.AssemblyGroup || ''
             });
             // --- END MODIFICATION ---
         }
@@ -433,11 +434,113 @@ const runSchedulingEngine = async (
             schedulableTasksMap.get(key).push(task);
         });
 
+        // =========================================================
+        // ASSEMBLY GROUP SYNCHRONIZATION - Data Structure Setup
+        // =========================================================
+        // Build a map of assembly groups: groupKey -> { skus, skuInfo, leadSku }
+        // This enables cross-SKU dependencies at Final Assembly
+        const assemblyGroupMap = new Map();
+
+        operations_df.forEach(task => {
+            if (!task.AssemblyGroup) return;
+
+            const groupKey = `${task.Project}|${task.AssemblyGroup}`;
+
+            if (!assemblyGroupMap.has(groupKey)) {
+                assemblyGroupMap.set(groupKey, {
+                    project: task.Project,
+                    groupName: task.AssemblyGroup,
+                    skus: new Set(),
+                    skuInfo: new Map() // SKU -> { finalAssemblyOrder, preAssemblyTasks[], totalPreAssemblyHours }
+                });
+            }
+
+            const group = assemblyGroupMap.get(groupKey);
+            group.skus.add(task.SKU);
+
+            if (!group.skuInfo.has(task.SKU)) {
+                group.skuInfo.set(task.SKU, {
+                    finalAssemblyOrder: Infinity,
+                    preAssemblyTasks: [],
+                    totalPreAssemblyHours: 0
+                });
+            }
+
+            const skuInfo = group.skuInfo.get(task.SKU);
+            if (task.Operation === 'Final Assembly') {
+                skuInfo.finalAssemblyOrder = task.Order;
+            }
+        });
+
+        // Second pass: classify pre-assembly tasks and identify lead SKU
+        assemblyGroupMap.forEach((group, groupKey) => {
+            group.skuInfo.forEach((info, sku) => {
+                const skuKey = `${group.project}|${sku}`;
+                const allSkuTasks = schedulableTasksMap.get(skuKey) || [];
+
+                info.preAssemblyTasks = allSkuTasks.filter(t => t.Order < info.finalAssemblyOrder);
+                info.totalPreAssemblyHours = info.preAssemblyTasks.reduce(
+                    (sum, t) => sum + (t['Estimated Hours'] || 0), 0
+                );
+            });
+
+            // Lead SKU = the one with the most pre-assembly hours
+            let leadSku = null;
+            let maxHours = 0;
+            group.skuInfo.forEach((info, sku) => {
+                if (info.totalPreAssemblyHours > maxHours) {
+                    maxHours = info.totalPreAssemblyHours;
+                    leadSku = sku;
+                }
+            });
+            group.leadSku = leadSku;
+        });
+
+        // Build fast per-task lookup: TaskID -> { groupKey, isPreAssembly, isFinalAssembly, isLeadSku }
+        const assemblyGroupTaskLookup = new Map();
+        operations_df.forEach(task => {
+            if (!task.AssemblyGroup) return;
+
+            const groupKey = `${task.Project}|${task.AssemblyGroup}`;
+            const group = assemblyGroupMap.get(groupKey);
+            if (!group) return;
+
+            const skuInfo = group.skuInfo.get(task.SKU);
+            if (!skuInfo) return;
+
+            const isFinalAssembly = task.Operation === 'Final Assembly';
+            const isPreAssembly = task.Order < skuInfo.finalAssemblyOrder;
+            const isLeadSku = task.SKU === group.leadSku;
+
+            assemblyGroupTaskLookup.set(task.TaskID, {
+                groupKey,
+                isPreAssembly,
+                isFinalAssembly,
+                isLeadSku,
+                isPostAssembly: !isPreAssembly && !isFinalAssembly
+            });
+        });
+
+        // Log assembly group info
+        if (assemblyGroupMap.size > 0) {
+            assemblyGroupMap.forEach((group, groupKey) => {
+                logs.push(`\n--- Assembly Group: "${group.groupName}" (${groupKey}) ---`);
+                logs.push(`  SKUs: ${group.skus.size}, Lead SKU: ${group.leadSku}`);
+                group.skuInfo.forEach((info, sku) => {
+                    logs.push(`  ${sku}: ${info.preAssemblyTasks.length} pre-assembly ops (${info.totalPreAssemblyHours.toFixed(1)} hrs), Final Assembly at Order ${info.finalAssemblyOrder === Infinity ? 'N/A' : info.finalAssemblyOrder}`);
+                });
+            });
+        }
+        // =========================================================
+        // END ASSEMBLY GROUP SYNCHRONIZATION - Data Structure Setup
+        // =========================================================
+
         let unscheduled_tasks = [...operations_df];
         const totalWorkloadHours = unscheduled_tasks.reduce((sum, task) => sum + task['Estimated Hours'], 0);
         let totalHoursCompleted = 0;
         let current_date = parseDate(params.startDate);
         let daily_log_entries = [], completed_operations = [];
+        const completedTaskIDs = new Set(); // O(1) lookup for assembly group gate checks
         logs.push(`Starting with ${unscheduled_tasks.length} schedulable tasks.`);
         let loopCounter = 0; const maxDays = 365 * 2;
         let dailyDwellingData = {};
@@ -459,7 +562,22 @@ const runSchedulingEngine = async (
             }
             
             // --- MODIFIED SECTION ---
-            // Replaced the original isReady function with one that understands LagAfterHours.
+            // isReady: checks LagAfterHours + Assembly Group gate at Final Assembly.
+            // Helper: checks if all sibling SKUs' pre-assembly work is done
+            const checkAssemblyGroupReady = (task, groupKey) => {
+                const group = assemblyGroupMap.get(groupKey);
+                if (!group) return true;
+
+                for (const [siblingSkU, siblingInfo] of group.skuInfo) {
+                    for (const preTask of siblingInfo.preAssemblyTasks) {
+                        if (!completedTaskIDs.has(preTask.TaskID)) {
+                            return false; // A sibling still has unfinished pre-assembly work
+                        }
+                    }
+                }
+                return true; // All siblings' pre-assembly work is done
+            };
+
             const isReady = (task) => {
                 if (current_date < task.StartDate) return false;
 
@@ -468,10 +586,16 @@ const runSchedulingEngine = async (
                 const predecessors = allSkuTasks.filter(t => t.Order < task.Order);
 
                 if (predecessors.length === 0) {
-                    return true; // First operation is always ready if after start date
+                    // First operation in this SKU - check assembly group gate
+                    // (handles cases like D-104 where Final Assembly IS the first op)
+                    const taskGroupInfo = assemblyGroupTaskLookup.get(task.TaskID);
+                    if (taskGroupInfo && taskGroupInfo.isFinalAssembly) {
+                        return checkAssemblyGroupReady(task, taskGroupInfo.groupKey);
+                    }
+                    return true;
                 }
 
-                return predecessors.every(p => {
+                const predecessorsReady = predecessors.every(p => {
                     const completedPredecessor = completed_operations.find(c => c.TaskID === p.TaskID);
                     if (!completedPredecessor) {
                         return false; // Predecessor isn't done yet
@@ -482,16 +606,27 @@ const runSchedulingEngine = async (
                     if (lagHours === 0) {
                         return true; // No lag, so it's ready
                     }
-                    
+
                     const hoursPerWorkDay = parseFloat(params.hoursPerDay) || 8;
                     const lagInDays = lagHours / hoursPerWorkDay;
-                    
+
                     const completionDate = new Date(completedPredecessor.CompletionDate);
                     const readyDate = new Date(completionDate.getTime());
                     readyDate.setDate(readyDate.getDate() + Math.ceil(lagInDays));
 
                     return current_date >= readyDate;
                 });
+
+                if (!predecessorsReady) return false;
+
+                // Assembly Group gate: if this is Final Assembly in a group,
+                // all sibling SKUs must have their pre-assembly work done
+                const taskGroupInfo = assemblyGroupTaskLookup.get(task.TaskID);
+                if (taskGroupInfo && taskGroupInfo.isFinalAssembly) {
+                    return checkAssemblyGroupReady(task, taskGroupInfo.groupKey);
+                }
+
+                return true;
             };
             // --- END MODIFICATION ---
 
@@ -513,7 +648,19 @@ const runSchedulingEngine = async (
                 } else {
                     dueDateMultiplier = 1 + (60 / (daysUntilDue + 1));
                 }
-                task.DynamicPriority = (task.BasePriority * dueDateMultiplier) / task.TeamCapacity;
+
+                // Assembly Group sync multiplier: boost lead SKU, hold back non-lead
+                let assemblyGroupMultiplier = 1.0;
+                const taskGroupInfo = assemblyGroupTaskLookup.get(task.TaskID);
+                if (taskGroupInfo && taskGroupInfo.isPreAssembly) {
+                    if (taskGroupInfo.isLeadSku) {
+                        assemblyGroupMultiplier = 1.3; // Boost lead SKU's pre-assembly work
+                    } else {
+                        assemblyGroupMultiplier = 0.75; // Hold back non-lead SKUs
+                    }
+                }
+
+                task.DynamicPriority = (task.BasePriority * dueDateMultiplier * assemblyGroupMultiplier) / task.TeamCapacity;
             });
 
             const dailyRoster = {};
@@ -730,6 +877,7 @@ const runSchedulingEngine = async (
 
                                             if (taskInArray.HoursRemaining <= 0.01) {
                                                 completed_operations.push({ Project: task_to_assign.Project, SKU: task_to_assign.SKU, Order: task_to_assign.Order, TaskID: task_to_assign.TaskID, CompletionDate: new Date(current_date) });
+                                                completedTaskIDs.add(task_to_assign.TaskID);
                                                 if (taskInArray.Order === skuMaxOrderMap[taskInArray.SKU]) {
                                                     const skuKey = `${taskInArray.Project}|${taskInArray.SKU}`;
                                                     const finalSkuValue = skuValueMap[skuKey] || 0;
