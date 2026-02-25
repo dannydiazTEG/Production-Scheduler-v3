@@ -440,7 +440,11 @@ const runSchedulingEngine = async (
         let daily_log_entries = [], completed_operations = [];
         logs.push(`Starting with ${unscheduled_tasks.length} schedulable tasks.`);
         let loopCounter = 0; const maxDays = 365 * 2;
+        let workDayCounter = 0;
         let dailyDwellingData = {};
+        let lastCompletedCount = 0;
+        let stallDays = 0;
+        const MAX_STALL_WORK_DAYS = 30; // Break out if no tasks complete for 30 work days
 
         // Overtime tracking: max 3 months, then 1 month cooldown
         const overtimeTracking = {}; // { team: { startDate, endDate, inCooldown, cooldownEndDate } }
@@ -457,7 +461,8 @@ const runSchedulingEngine = async (
                 loopCounter++;
                 continue;
             }
-            
+            workDayCounter++;
+
             // --- MODIFIED SECTION ---
             // Replaced the original isReady function with one that understands LagAfterHours.
             const isReady = (task) => {
@@ -746,9 +751,26 @@ const runSchedulingEngine = async (
                 }
                 unscheduled_tasks = unscheduled_tasks.filter(t => t.HoursRemaining > 0.01);
             }
+
+            // Stall detection: break early if no tasks have completed in MAX_STALL_WORK_DAYS
+            const currentCompletedCount = completed_operations.length;
+            if (currentCompletedCount > lastCompletedCount) {
+                lastCompletedCount = currentCompletedCount;
+                stallDays = 0;
+            } else {
+                stallDays++;
+            }
+            if (stallDays >= MAX_STALL_WORK_DAYS) {
+                logs.push(`\n⚠️ Schedule stalled: No tasks completed in ${MAX_STALL_WORK_DAYS} work days. ${unscheduled_tasks.length} tasks remain unschedulable.`);
+                unscheduled_tasks.forEach(t => {
+                    logs.push(`  - Stuck: ${t.Project} | ${t.SKU} | ${t.Operation} (Team: ${t.Team}, Hours Remaining: ${t.HoursRemaining.toFixed(1)})`);
+                });
+                break;
+            }
+
             if (loopCounter % 5 === 0) {
                 const progress = 15 + Math.round((totalHoursCompleted / totalWorkloadHours) * 75);
-                updateProgress(progress, `Simulating Day ${loopCounter + 1}...`);
+                updateProgress(progress, `Simulating Work Day ${workDayCounter}...`);
                 await yieldToEventLoop();
             }
 
@@ -907,34 +929,6 @@ const runSchedulingEngine = async (
             return { week, teams };
         });
         
-        const newRecommendations = [];
-        const workloadThreshold = 120;
-        const consecutiveWeeksThreshold = 2;
-        const teamOverloadStreaks = {};
-        teamWorkload.forEach(weekData => {
-            weekData.teams.forEach(team => {
-                if (!teamOverloadStreaks[team.name]) teamOverloadStreaks[team.name] = { streak: 0, weeks: [] };
-                if (team.workloadRatio > workloadThreshold) {
-                    teamOverloadStreaks[team.name].streak++;
-                    teamOverloadStreaks[team.name].weeks.push(weekData.week);
-                } else {
-                    if (teamOverloadStreaks[team.name].streak >= consecutiveWeeksThreshold) newRecommendations.push({ team: team.name, weeks: [...teamOverloadStreaks[team.name].weeks], type: 'overload' });
-                    teamOverloadStreaks[team.name] = { streak: 0, weeks: [] };
-                }
-            });
-        });
-        for (const teamName in teamOverloadStreaks) {
-            if (teamOverloadStreaks[teamName].streak >= consecutiveWeeksThreshold) newRecommendations.push({ team: teamName, weeks: [...teamOverloadStreaks[teamName].weeks], type: 'overload' });
-        }
-        const recommendations = newRecommendations.map(rec => {
-            const startWeek = rec.weeks[0];
-            const endWeekDate = new Date(parseDate(rec.weeks[rec.weeks.length - 1]).getTime() + 6 * 24 * 60 * 60 * 1000);
-            const contributingProjects = daily_log_entries.filter(log => { const logDate = parseDate(log.Date); return log.Team === rec.team && logDate >= parseDate(startWeek) && logDate <= endWeekDate; }).reduce((acc, log) => { acc[log.Project] = (acc[log.Project] || 0) + log['Time Spent (Hours)']; return acc; }, {});
-            const topProjects = Object.entries(contributingProjects).sort(([, hoursA], [, hoursB]) => hoursB - hoursA).slice(0, 3).map(([projectName]) => projectName);
-            return { ...rec, topProjects };
-        });
-
-
         return {
             finalSchedule,
             projectSummary,
@@ -943,7 +937,7 @@ const runSchedulingEngine = async (
             weeklyOutput,
             dailyCompletions,
             teamWorkload,
-            recommendations,
+
             projectedCompletion,
             logs,
             error
@@ -3049,7 +3043,7 @@ app.post('/api/schedule', async (req, res) => {
                 jobs[jobId].step = 'done';
                 jobs[jobId].result = { 
                     finalSchedule: [], projectSummary: [], teamUtilization: [], weeklyOutput: [],
-                    dailyCompletions: [], teamWorkload: [], recommendations: [],
+                    dailyCompletions: [], teamWorkload: [],
                     projectedCompletion: null, logs: combinedLogs, completedTasks, error: '' 
                 };
                 return;
