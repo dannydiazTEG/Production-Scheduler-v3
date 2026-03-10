@@ -126,7 +126,7 @@ async function loadMasterRoutingData() {
             if (!groupedData[projectType]) groupedData[projectType] = [];
             
             // --- MODIFIED SECTION ---
-            // Added LagAfterHours to the data loading logic.
+            // Added LagAfterHours, AssemblyGroup, and DelayUntilClose to the data loading logic.
             groupedData[projectType].push({
                 "Operation": row.Operation,
                 "Estimated Hours": parseFloat(row['Estimated Hours']),
@@ -135,7 +135,8 @@ async function loadMasterRoutingData() {
                 "SKU Name": row['SKU Name'],
                 "Value": parseFloat(row.Value),
                 "LagAfterHours": parseFloat(row.LagAfterHours) || 0,
-                "AssemblyGroup": row.AssemblyGroup || ''
+                "AssemblyGroup": row.AssemblyGroup || '',
+                "DelayUntilClose": (row.DelayUntilClose || '').toUpperCase() === 'TRUE'
             });
             // --- END MODIFICATION ---
         }
@@ -535,6 +536,107 @@ const runSchedulingEngine = async (
         // END ASSEMBLY GROUP SYNCHRONIZATION - Data Structure Setup
         // =========================================================
 
+        // =========================================================
+        // DELAYED SKU CALCULATION - "Just-in-Time" Scheduling
+        // =========================================================
+        // Certain SKUs (e.g., IT Package BOH-107) have subscription fees
+        // that start when set up. These should be scheduled as late as
+        // possible to avoid unnecessary costs.
+        // Flag comes from Google Sheet "DelayUntilClose" column, with a
+        // hardcoded fallback list for SKUs that should always be delayed.
+        const HARDCODED_DELAYED_SKUS = new Set([
+            'BOH-107',  // IT Package - subscription fees
+            'CC-405C',  // Clue Cranium
+            'R-401',    // Ruins
+            'D-155',    // Depths
+            'GR-143',   // Gold Rush
+            'LY-401',   // Lucky
+            'PB-141',   // Prison Break
+            'PG-139',   // Playground
+            'RU-406',   // Rush Hour (previously Heist)
+            'SP-147',   // Special Agent
+            'TH-140',   // The Heist
+            'TL-406',   // Time Lab (previously unknown)
+            // Note: These SKUs are typically done late in the process and
+            // should not be pulled forward by the scheduler.
+        ]);
+        const DELAY_BUFFER_DAYS = 15; // work days of safety margin before due date
+
+        const delayedSkuStartDates = new Map(); // key: "Project|SKU" -> lateStartDate
+
+        schedulableTasksMap.forEach((tasks, key) => {
+            // A SKU is delayed if ANY of its tasks has the flag from routing data,
+            // OR if the SKU is in the hardcoded fallback list
+            const isDelayed = tasks.some(t => t.DelayUntilClose) || HARDCODED_DELAYED_SKUS.has(tasks[0].SKU);
+            if (!isDelayed) return;
+
+            // Sum total estimated hours for all operations in this SKU
+            const totalHours = tasks.reduce((sum, t) => sum + (t['Estimated Hours'] || 0), 0);
+
+            // Sum total lag hours between operations
+            const totalLagHours = tasks.reduce((sum, t) => sum + (t.LagAfterHours || 0), 0);
+
+            const hoursPerWorkDay = parseFloat(params.hoursPerDay) || 8;
+            const productivity = parseFloat(params.productivityAssumption) || 0.78;
+
+            // Convert to work days needed (accounting for productivity)
+            const workDaysNeeded = Math.ceil((totalHours / productivity) / hoursPerWorkDay);
+            const lagDaysNeeded = Math.ceil(totalLagHours / hoursPerWorkDay);
+            const totalDaysNeeded = workDaysNeeded + lagDaysNeeded + DELAY_BUFFER_DAYS;
+
+            // Get the DueDate from the first task (all tasks in a SKU share the same DueDate)
+            const dueDate = tasks[0].DueDate;
+            if (!dueDate) return;
+
+            // Walk backward from DueDate, skipping weekends and holidays
+            let lateStartDate = new Date(dueDate);
+            let daysSubtracted = 0;
+            while (daysSubtracted < totalDaysNeeded) {
+                lateStartDate.setDate(lateStartDate.getDate() - 1);
+                const dow = lateStartDate.getDay();
+                const dateStr = formatDate(lateStartDate);
+                if (dow !== 0 && dow !== 6 && !holidayList.has(dateStr)) {
+                    daysSubtracted++;
+                }
+            }
+
+            // If late start is before the project's original StartDate, fall back
+            const originalStartDate = tasks[0].StartDate;
+            if (lateStartDate < originalStartDate) {
+                lateStartDate = new Date(originalStartDate);
+                logs.push(`WARNING: Delayed SKU ${tasks[0].SKU} (${tasks[0]['SKU Name'] || ''}) in ${tasks[0].Project} cannot be fully delayed - insufficient time before due date. Falling back to project start date.`);
+            }
+
+            delayedSkuStartDates.set(key, lateStartDate);
+            logs.push(`Delayed SKU: ${tasks[0].SKU} (${tasks[0]['SKU Name'] || ''}) in ${tasks[0].Project} - late start: ${formatDate(lateStartDate)} (needs ${totalDaysNeeded} work days before due ${formatDate(dueDate)})`);
+        });
+
+        // Warn about assembly group conflicts with delayed SKUs
+        if (delayedSkuStartDates.size > 0 && assemblyGroupMap.size > 0) {
+            assemblyGroupMap.forEach((group, groupKey) => {
+                const delayedSkus = [];
+                const nonDelayedSkus = [];
+                group.skus.forEach(sku => {
+                    const skuKey = `${group.project}|${sku}`;
+                    if (delayedSkuStartDates.has(skuKey)) {
+                        delayedSkus.push(sku);
+                    } else {
+                        nonDelayedSkus.push(sku);
+                    }
+                });
+                if (delayedSkus.length > 0 && nonDelayedSkus.length > 0) {
+                    logs.push(`WARNING: Assembly group "${group.groupName}" contains both delayed SKUs (${delayedSkus.join(', ')}) and non-delayed SKUs (${nonDelayedSkus.join(', ')}). The delayed SKUs will hold up Final Assembly for the entire group.`);
+                }
+            });
+        }
+
+        if (delayedSkuStartDates.size > 0) {
+            logs.push(`Total delayed SKUs: ${delayedSkuStartDates.size}`);
+        }
+        // =========================================================
+        // END DELAYED SKU CALCULATION
+        // =========================================================
+
         let unscheduled_tasks = [...operations_df];
         const totalWorkloadHours = unscheduled_tasks.reduce((sum, task) => sum + task['Estimated Hours'], 0);
         let totalHoursCompleted = 0;
@@ -580,6 +682,11 @@ const runSchedulingEngine = async (
 
             const isReady = (task) => {
                 if (current_date < task.StartDate) return false;
+
+                // Delayed SKU gate: don't start until calculated late-start date
+                const skuKey = `${task.Project}|${task.SKU}`;
+                const lateStartDate = delayedSkuStartDates.get(skuKey);
+                if (lateStartDate && current_date < lateStartDate) return false;
 
                 const key = `${task.Project}|${task.SKU}`;
                 const allSkuTasks = schedulableTasksMap.get(key) || [];
