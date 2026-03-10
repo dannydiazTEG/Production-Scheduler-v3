@@ -601,6 +601,11 @@ const runSchedulingEngine = async (
                         return false; // Predecessor isn't done yet
                     }
 
+                    // QC gets items the same day they're done — no buffer delay
+                    if (task.Team === 'QC') {
+                        return true;
+                    }
+
                     // Predecessor is done, now check for lag time.
                     const lagHours = p.LagAfterHours || 0;
                     if (lagHours === 0) {
