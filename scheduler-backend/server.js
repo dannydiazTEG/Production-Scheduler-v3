@@ -641,7 +641,7 @@ const runSchedulingEngine = async (
         const totalWorkloadHours = unscheduled_tasks.reduce((sum, task) => sum + task['Estimated Hours'], 0);
         let totalHoursCompleted = 0;
         let current_date = parseDate(params.startDate);
-        let daily_log_entries = [], completed_operations = [];
+        let daily_log_entries = [], completed_operations = [], dailyPrioritySnapshots = [];
         const completedTaskIDs = new Set(); // O(1) lookup for assembly group gate checks
         logs.push(`Starting with ${unscheduled_tasks.length} schedulable tasks.`);
         let loopCounter = 0; const maxDays = 365 * 2;
@@ -774,6 +774,37 @@ const runSchedulingEngine = async (
 
                 task.DynamicPriority = (task.BasePriority * dueDateMultiplier * assemblyGroupMultiplier) / task.TeamCapacity;
             });
+
+            // Capture daily priority snapshots (sample top tasks per team to keep size manageable)
+            if (current_date.getDay() !== 0 && current_date.getDay() !== 6) {
+                const readyForSnapshot = unscheduled_tasks.filter(t => t.HoursRemaining > 0);
+                readyForSnapshot.sort((a, b) => b.DynamicPriority - a.DynamicPriority);
+                const topTasks = readyForSnapshot.slice(0, 100);
+                topTasks.forEach(t => {
+                    const dueDate = t.DueDate instanceof Date ? t.DueDate : parseDate(t.DueDate);
+                    const daysUntilDue = dueDate ? Math.ceil((dueDate - current_date) / (1000 * 60 * 60 * 24)) : 999;
+                    dailyPrioritySnapshots.push({
+                        Date: currentDateStr,
+                        TaskID: t.TaskID,
+                        Project: t.Project,
+                        Store: t.Store,
+                        SKU: t.SKU,
+                        'SKU Name': t['SKU Name'] || '',
+                        Operation: t.Operation,
+                        Team: t.Team,
+                        Order: t.Order,
+                        HoursRemaining: Number(t.HoursRemaining.toFixed(2)),
+                        BasePriority: Number(t.BasePriority.toFixed(2)),
+                        DueDateMultiplier: Number(((t.DynamicPriority * t.TeamCapacity) / (t.BasePriority || 1)).toFixed(2)),
+                        BottleneckMultiplier: 1,
+                        DwellMultiplier: 1,
+                        TeamCapacity: t.TeamCapacity,
+                        DynamicPriority: Number(t.DynamicPriority.toFixed(2)),
+                        DaysUntilDue: daysUntilDue,
+                        DaysSinceLastStep: 0,
+                    });
+                });
+            }
 
             const dailyRoster = {};
             Object.keys(teamHeadcounts).forEach(team => {
@@ -1205,6 +1236,7 @@ const runSchedulingEngine = async (
             teamWorkload,
             recommendations,
             projectedCompletion,
+            dailyPrioritySnapshots,
             logs,
             error
         };
