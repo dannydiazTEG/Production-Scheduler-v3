@@ -775,11 +775,11 @@ const runSchedulingEngine = async (
                 task.DynamicPriority = (task.BasePriority * dueDateMultiplier * assemblyGroupMultiplier) / task.TeamCapacity;
             });
 
-            // Capture daily priority snapshots (sample top tasks per team to keep size manageable)
-            if (current_date.getDay() !== 0 && current_date.getDay() !== 6) {
+            // Capture priority snapshots weekly (Mondays) with top 50 tasks to keep response size manageable
+            if (current_date.getDay() === 1) {
                 const readyForSnapshot = unscheduled_tasks.filter(t => t.HoursRemaining > 0);
                 readyForSnapshot.sort((a, b) => b.DynamicPriority - a.DynamicPriority);
-                const topTasks = readyForSnapshot.slice(0, 100);
+                const topTasks = readyForSnapshot.slice(0, 50);
                 topTasks.forEach(t => {
                     const dueDate = t.DueDate instanceof Date ? t.DueDate : parseDate(t.DueDate);
                     const daysUntilDue = dueDate ? Math.ceil((dueDate - current_date) / (1000 * 60 * 60 * 24)) : 999;
@@ -3411,9 +3411,12 @@ const startServer = async () => {
         console.error(`WARNING: Could not establish initial connection to Snowflake via the pool. The server will still start, but queries will fail until the connection is restored. Error: ${err.message}`);
     }
 
-    app.listen(port, '0.0.0.0', () => {
+    const server = app.listen(port, '0.0.0.0', () => {
         console.log(`SERVER IS LIVE AND LISTENING ON ALL INTERFACES - Port: ${port}`);
     });
+    server.timeout = 600000; // 10 minutes for long-running schedule requests
+    server.keepAliveTimeout = 120000; // 2 minutes keep-alive
+    server.headersTimeout = 620000; // Slightly above server.timeout
 };
 
 // Global error handlers
