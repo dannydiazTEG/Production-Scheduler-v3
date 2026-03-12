@@ -66,9 +66,11 @@ app.use(express.urlencoded({ limit: '100mb', extended: true }));
 const jobs = {};
 
 // --- JOB CLEANUP TO PREVENT MEMORY LEAKS ---
-// Automatically removes completed jobs older than 1 hour
-const JOB_RETENTION_MS = 60 * 60 * 1000; // 1 hour
-const CLEANUP_INTERVAL_MS = 10 * 60 * 1000; // Run cleanup every 10 minutes
+const JOB_RETENTION_MS = 5 * 60 * 1000;       // 5 minutes (was 1 hour)
+const CLEANUP_INTERVAL_MS = 30 * 1000;          // 30 seconds (was 10 minutes)
+const MAX_JOBS = 5;                             // Max concurrent jobs in memory
+const MAX_LOG_LINES = 200;                      // Max log entries stored per job result
+const MEMORY_THRESHOLD_MB = 400;                // Reject new jobs above this heap usage
 
 function cleanupOldJobs() {
     const now = Date.now();
@@ -76,22 +78,39 @@ function cleanupOldJobs() {
 
     for (const jobId in jobs) {
         const job = jobs[jobId];
-        // Remove jobs that are complete or errored AND older than retention period
-        if ((job.status === 'complete' || job.status === 'error') &&
-            job.createdAt && (now - job.createdAt > JOB_RETENTION_MS)) {
+        const age = now - (job.createdAt || 0);
+
+        // Remove terminal jobs older than retention period
+        if ((job.status === 'complete' || job.status === 'error') && age > JOB_RETENTION_MS) {
             delete jobs[jobId];
             removedCount++;
+            continue;
+        }
+        // Safety net: remove ANY job older than 15 minutes regardless of status
+        // (catches stuck 'running' jobs from crashes)
+        if (age > 15 * 60 * 1000) {
+            console.warn(`[Cleanup] Removing stale job ${jobId} (status: ${job.status}, age: ${(age / 1000 / 60).toFixed(1)}min)`);
+            delete jobs[jobId];
+            removedCount++;
+            continue;
+        }
+        // Strip undelivered results from completed jobs older than 2 minutes
+        // (client probably navigated away without fetching)
+        if (job.status === 'complete' && job.result && age > 2 * 60 * 1000) {
+            console.log(`[Cleanup] Stripping undelivered result from job ${jobId}`);
+            job.result = null;
         }
     }
 
     if (removedCount > 0) {
-        console.log(`Cleaned up ${removedCount} old jobs. Active jobs remaining: ${Object.keys(jobs).length}`);
+        const heapMB = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(0);
+        console.log(`Cleaned ${removedCount} jobs. Remaining: ${Object.keys(jobs).length}. Heap: ${heapMB}MB`);
     }
 }
 
 // Start periodic cleanup
 setInterval(cleanupOldJobs, CLEANUP_INTERVAL_MS);
-console.log('Job cleanup service started. Will run every 10 minutes to remove jobs older than 1 hour.');
+console.log('Job cleanup service started. Runs every 30s, removes jobs older than 5 minutes.');
 
 // --- CONSTANTS ---
 // UPDATED: Added 'Receiving' (start of flow) and 'QC' (end of flow) to sort order
@@ -162,17 +181,24 @@ async function loadMasterRoutingData() {
 // =================================================================
 // --- SNOWFLAKE CONNECTION POOL ---
 // =================================================================
-const snowflakePool = snowflake.createPool({
-    account: process.env.SNOWFLAKE_ACCOUNT,
-    username: process.env.SNOWFLAKE_USER,
-    password: process.env.SNOWFLAKE_PASSWORD,
-    warehouse: process.env.SNOWFLAKE_WAREHOUSE,
-    database: process.env.SNOWFLAKE_DATABASE,
-    schema: process.env.SNOWFLAKE_SCHEMA
-}, {
-    max: 10, // max number of connections in the pool
-    min: 1   // min number of connections in the pool
-});
+let snowflakePool;
+try {
+    snowflakePool = snowflake.createPool({
+        account: process.env.SNOWFLAKE_ACCOUNT,
+        username: process.env.SNOWFLAKE_USER,
+        password: process.env.SNOWFLAKE_PASSWORD,
+        warehouse: process.env.SNOWFLAKE_WAREHOUSE,
+        database: process.env.SNOWFLAKE_DATABASE,
+        schema: process.env.SNOWFLAKE_SCHEMA
+    }, {
+        max: 10, // max number of connections in the pool
+        min: 1   // min number of connections in the pool
+    });
+} catch (err) {
+    console.error(`WARNING: Failed to create Snowflake connection pool: ${err.message}`);
+    console.error('Server will start but Snowflake-dependent features will not work.');
+    snowflakePool = null;
+}
 
 // --- Helper Functions ---
 const parseDate = (dateStr) => {
@@ -1229,7 +1255,6 @@ const runSchedulingEngine = async (
         return {
             finalSchedule,
             projectSummary,
-            taskSummary: finalSchedule, // Add taskSummary for bottleneck detection
             teamUtilization,
             weeklyOutput,
             dailyCompletions,
@@ -1566,18 +1591,18 @@ function identifyBottlenecks(scheduleResult, baseParams, baseTeamDefs) {
     console.log("=== identifyBottlenecks STARTED ===");
     const bottlenecks = [];
 
-    if (!scheduleResult || !scheduleResult.taskSummary) {
-        console.log("No scheduleResult or taskSummary, returning empty bottlenecks");
+    if (!scheduleResult || !scheduleResult.finalSchedule) {
+        console.log("No scheduleResult or finalSchedule, returning empty bottlenecks");
         return bottlenecks;
     }
 
-    console.log(`Analyzing ${scheduleResult.taskSummary.length} tasks...`);
+    console.log(`Analyzing ${scheduleResult.finalSchedule.length} tasks...`);
 
     // Analyze ALL tasks to find high-utilization periods (not just late projects)
     const teamLoad = {};
 
     // Group all tasks by team and week
-    scheduleResult.taskSummary.forEach(task => {
+    scheduleResult.finalSchedule.forEach(task => {
         if (task.Date && task.Team) {
             const team = task.Team || 'Unknown';
             const workDate = new Date(task.Date);
@@ -1684,7 +1709,7 @@ function identifyBottlenecks(scheduleResult, baseParams, baseTeamDefs) {
             const lateProjectLoad = {};
 
             lateProjects.forEach(project => {
-                const projectTasks = scheduleResult.taskSummary?.filter(t => t.Project === project.project) || [];
+                const projectTasks = scheduleResult.finalSchedule?.filter(t => t.Project === project.project) || [];
 
                 projectTasks.forEach(task => {
                     if (task.Date && task.Team) {
@@ -2714,8 +2739,8 @@ async function runMultiScenarioAnalysis(
         );
 
         console.log("Baseline result received:", {
-            hasTaskSummary: !!baselineResult?.taskSummary,
-            taskSummaryLength: baselineResult?.taskSummary?.length || 0,
+            hasFinalSchedule: !!baselineResult?.finalSchedule,
+            finalScheduleLength: baselineResult?.finalSchedule?.length || 0,
             hasProjectSummary: !!baselineResult?.projectSummary,
             projectSummaryLength: baselineResult?.projectSummary?.length || 0
         });
@@ -3145,6 +3170,19 @@ function calculateScenarioSummary(scenario, result, baseTeamDefs, baseParams, en
 // --- NEW API ENDPOINT: Multi-Scenario Analysis ---
 app.post('/api/scenarios', async (req, res) => {
     console.log('Received request to /api/scenarios to start multi-scenario analysis.');
+
+    // Memory circuit breaker
+    const heapUsedMB = process.memoryUsage().heapUsed / 1024 / 1024;
+    if (heapUsedMB > MEMORY_THRESHOLD_MB) {
+        console.warn(`Memory circuit breaker: ${heapUsedMB.toFixed(0)}MB heap used, threshold ${MEMORY_THRESHOLD_MB}MB`);
+        return res.status(503).json({ error: 'Server is under heavy load. Please wait a moment and try again.' });
+    }
+    const activeJobCount = Object.values(jobs).filter(j => j.status === 'running' || j.status === 'pending').length;
+    if (activeJobCount >= MAX_JOBS) {
+        console.warn(`Max jobs reached: ${activeJobCount} active`);
+        return res.status(503).json({ error: 'Too many jobs running. Please wait and try again.' });
+    }
+
     const jobId = uuidv4();
 
     jobs[jobId] = {
@@ -3209,6 +3247,19 @@ app.post('/api/scenarios', async (req, res) => {
 // --- NEW API ENDPOINT: Optimize Resources ---
 app.post('/api/optimize', async (req, res) => {
     console.log('Received request to /api/optimize to start optimization job.');
+
+    // Memory circuit breaker
+    const heapUsedMB = process.memoryUsage().heapUsed / 1024 / 1024;
+    if (heapUsedMB > MEMORY_THRESHOLD_MB) {
+        console.warn(`Memory circuit breaker: ${heapUsedMB.toFixed(0)}MB heap used, threshold ${MEMORY_THRESHOLD_MB}MB`);
+        return res.status(503).json({ error: 'Server is under heavy load. Please wait a moment and try again.' });
+    }
+    const activeJobCount = Object.values(jobs).filter(j => j.status === 'running' || j.status === 'pending').length;
+    if (activeJobCount >= MAX_JOBS) {
+        console.warn(`Max jobs reached: ${activeJobCount} active`);
+        return res.status(503).json({ error: 'Too many jobs running. Please wait and try again.' });
+    }
+
     const jobId = uuidv4();
 
     jobs[jobId] = {
@@ -3281,17 +3332,41 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
+    const mem = process.memoryUsage();
     res.json({
         status: 'healthy',
         timestamp: new Date().toISOString(),
-        memory: process.memoryUsage(),
-        activeJobs: Object.keys(jobs).length
+        memory: {
+            heapUsedMB: +(mem.heapUsed / 1024 / 1024).toFixed(1),
+            heapTotalMB: +(mem.heapTotal / 1024 / 1024).toFixed(1),
+            rssMB: +(mem.rss / 1024 / 1024).toFixed(1),
+        },
+        activeJobs: Object.keys(jobs).length,
+        jobDetails: Object.entries(jobs).map(([id, j]) => ({
+            id: id.slice(0, 8),
+            status: j.status,
+            hasResult: !!j.result,
+            ageSeconds: Math.round((Date.now() - j.createdAt) / 1000)
+        }))
     });
 });
 
 // --- API Endpoints ---
 app.post('/api/schedule', async (req, res) => {
     console.log('Received request to /api/schedule to start a new job.');
+
+    // Memory circuit breaker
+    const heapUsedMB = process.memoryUsage().heapUsed / 1024 / 1024;
+    if (heapUsedMB > MEMORY_THRESHOLD_MB) {
+        console.warn(`Memory circuit breaker: ${heapUsedMB.toFixed(0)}MB heap used, threshold ${MEMORY_THRESHOLD_MB}MB`);
+        return res.status(503).json({ error: 'Server is under heavy load. Please wait a moment and try again.' });
+    }
+    const activeJobCount = Object.values(jobs).filter(j => j.status === 'running' || j.status === 'pending').length;
+    if (activeJobCount >= MAX_JOBS) {
+        console.warn(`Max jobs reached: ${activeJobCount} active`);
+        return res.status(503).json({ error: 'Too many jobs running. Please wait and try again.' });
+    }
+
     const jobId = uuidv4();
 
     jobs[jobId] = {
@@ -3304,10 +3379,10 @@ app.post('/api/schedule', async (req, res) => {
         createdAt: Date.now(),
     };
 
-    const { 
+    const {
         projectTasks, params, teamDefs, ptoEntries, teamMemberChanges,
         workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
-        startDateOverrides, endDateOverrides 
+        startDateOverrides, endDateOverrides
     } = req.body;
 
     if (!projectTasks || !params || !teamDefs) {
@@ -3315,7 +3390,7 @@ app.post('/api/schedule', async (req, res) => {
         jobs[jobId].error = 'Missing required data from frontend.';
         return res.status(400).json({ error: jobs[jobId].error });
     }
-    
+
     res.status(202).json({ jobId });
 
     (async () => {
@@ -3357,12 +3432,24 @@ app.post('/api/schedule', async (req, res) => {
             );
             
             const combinedLogs = [...prepLogs, ...(results.logs || [])];
-            
+
+            // Trim logs to prevent bloated result payloads
+            const trimmedLogs = combinedLogs.length > MAX_LOG_LINES
+                ? [
+                    ...combinedLogs.slice(0, 50),
+                    `--- ${combinedLogs.length - MAX_LOG_LINES} log entries trimmed ---`,
+                    ...combinedLogs.slice(-(MAX_LOG_LINES - 51))
+                  ]
+                : combinedLogs;
+
+            // Strip recommendations (unused by frontend) to reduce payload size
+            const { recommendations, ...trimmedResults } = results;
+
             jobs[jobId].status = 'complete';
             jobs[jobId].progress = 100;
             jobs[jobId].message = 'Scheduling complete!';
             jobs[jobId].step = 'done';
-            jobs[jobId].result = { ...results, logs: combinedLogs, completedTasks };
+            jobs[jobId].result = { ...trimmedResults, logs: trimmedLogs, completedTasks };
 
         } catch (e) {
             console.error(`[Job ${jobId}] Failed to run scheduling engine:`, e);
@@ -3381,7 +3468,18 @@ app.get('/api/schedule/status/:jobId', (req, res) => {
         return res.status(404).json({ error: 'Job not found.' });
     }
 
+    // Send the full response (including result if present)
     res.json(job);
+
+    // After sending: if job is terminal and has a result, strip the heavy payload.
+    // Express res.json() serializes synchronously, so the client gets the full data.
+    // The client only needs the result once (clears polling interval on 'complete').
+    if ((job.status === 'complete' || job.status === 'error') && job.result) {
+        const resultKeys = Object.keys(job.result);
+        console.log(`[Job ${jobId}] Result delivered to client (keys: ${resultKeys.join(', ')}). Releasing from memory.`);
+        job.result = null;
+        job.resultDeliveredAt = Date.now();
+    }
 });
 
 // Catch-all error handler for Express (must be after all routes)
@@ -3401,14 +3499,18 @@ app.use((err, req, res, next) => {
 const startServer = async () => {
     await loadMasterRoutingData();
     
-    console.log("Testing Snowflake pool connection...");
-    try {
-        await snowflakePool.use(async (connection) => {
-            await connection.execute({ sqlText: 'SELECT 1;' });
-        });
-        console.log('Successfully connected to Snowflake and tested the connection pool.');
-    } catch (err) {
-        console.error(`WARNING: Could not establish initial connection to Snowflake via the pool. The server will still start, but queries will fail until the connection is restored. Error: ${err.message}`);
+    if (snowflakePool) {
+        console.log("Testing Snowflake pool connection...");
+        try {
+            await snowflakePool.use(async (connection) => {
+                await connection.execute({ sqlText: 'SELECT 1;' });
+            });
+            console.log('Successfully connected to Snowflake and tested the connection pool.');
+        } catch (err) {
+            console.error(`WARNING: Could not establish initial connection to Snowflake via the pool. The server will still start, but queries will fail until the connection is restored. Error: ${err.message}`);
+        }
+    } else {
+        console.warn('WARNING: Snowflake pool not initialized. Snowflake-dependent features disabled.');
     }
 
     const server = app.listen(port, '0.0.0.0', () => {
