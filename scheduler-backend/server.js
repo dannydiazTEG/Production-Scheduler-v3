@@ -296,41 +296,32 @@ async function prepareProjectData(projectTasks, updateProgress) {
 }
 
 
-// --- Completion Timeline Computation ---
-function computeCompletionTimeline(projectTasks, completedTasks, finalSchedule, startDate) {
-    // 1. Total hours per project (from the original, unfiltered task list)
+// --- Completion Timeline Computation (based on completed operations) ---
+function computeCompletionTimeline(projectTasks, completedTasks, completedOperations, startDate) {
+    // 1. Total operations per project (each task in projectTasks = one operation)
     const projectInfo = {};
     for (const task of projectTasks) {
         const proj = task.Project;
         if (!projectInfo[proj]) {
-            projectInfo[proj] = { totalHours: 0, store: task.Store || '' };
+            projectInfo[proj] = { totalOps: 0, store: task.Store || '' };
         }
-        projectInfo[proj].totalHours += parseFloat(task['Estimated Hours']) || 0;
+        projectInfo[proj].totalOps += 1;
     }
 
-    // 2. Build lookup from projectTasks to recover hours for Snowflake-completed tasks
-    const taskHoursLookup = {};
-    for (const task of projectTasks) {
-        const key = `${task.Project}|${task.SKU}|${task.Operation}`;
-        taskHoursLookup[key] = parseFloat(task['Estimated Hours']) || 0;
-    }
-
-    // Sum Snowflake-completed hours per project
-    const snowflakeHours = {};
+    // 2. Snowflake-completed operation count per project
+    const snowflakeOps = {};
     for (const ct of (completedTasks || [])) {
-        const key = `${ct.Project}|${ct.SKU}|${ct.Operation}`;
-        const hours = taskHoursLookup[key] || 0;
-        snowflakeHours[ct.Project] = (snowflakeHours[ct.Project] || 0) + hours;
+        snowflakeOps[ct.Project] = (snowflakeOps[ct.Project] || 0) + 1;
     }
 
-    // 3. Daily scheduled hours from finalSchedule, grouped by project + date
+    // 3. Scheduled operation completions per project per date
     const dailyByProject = {};
-    for (const entry of (finalSchedule || [])) {
-        const proj = entry.Project;
-        const date = entry.Date;
-        const hours = parseFloat(entry['Task Hours Completed']) || 0;
+    for (const op of (completedOperations || [])) {
+        const proj = op.Project;
+        const date = formatDate(op.CompletionDate);
+        if (!date) continue;
         if (!dailyByProject[proj]) dailyByProject[proj] = {};
-        dailyByProject[proj][date] = (dailyByProject[proj][date] || 0) + hours;
+        dailyByProject[proj][date] = (dailyByProject[proj][date] || 0) + 1;
     }
 
     // 4. Build timeline per project
@@ -338,31 +329,33 @@ function computeCompletionTimeline(projectTasks, completedTasks, finalSchedule, 
     const projects = [];
 
     for (const [proj, info] of Object.entries(projectInfo)) {
-        if (info.totalHours === 0) continue;
+        if (info.totalOps === 0) continue;
 
-        const sfHours = snowflakeHours[proj] || 0;
+        const sfOps = snowflakeOps[proj] || 0;
         const dailyMap = dailyByProject[proj] || {};
         const dates = Object.keys(dailyMap).sort();
 
         const timeline = [];
 
         // Starting point: Snowflake completion at schedule start
-        const startPct = (sfHours / info.totalHours) * 100;
+        const startPct = (sfOps / info.totalOps) * 100;
         timeline.push({
             date: startDate,
-            completedHours: Math.round(sfHours * 100) / 100,
+            completedOps: sfOps,
+            totalOps: info.totalOps,
             completionPct: Math.round(startPct * 10) / 10
         });
         allDatesSet.add(startDate);
 
-        // Accumulate daily work on top of the Snowflake base
-        let cumulative = sfHours;
+        // Accumulate daily completions on top of the Snowflake base
+        let cumulative = sfOps;
         for (const date of dates) {
             cumulative += dailyMap[date];
-            const pct = (cumulative / info.totalHours) * 100;
+            const pct = (cumulative / info.totalOps) * 100;
             timeline.push({
                 date,
-                completedHours: Math.round(cumulative * 100) / 100,
+                completedOps: cumulative,
+                totalOps: info.totalOps,
                 completionPct: Math.round(pct * 10) / 10
             });
             allDatesSet.add(date);
@@ -371,7 +364,7 @@ function computeCompletionTimeline(projectTasks, completedTasks, finalSchedule, 
         projects.push({
             project: proj,
             store: info.store,
-            totalHours: Math.round(info.totalHours * 100) / 100,
+            totalOps: info.totalOps,
             timeline
         });
     }
@@ -1362,6 +1355,7 @@ const runSchedulingEngine = async (
             recommendations,
             projectedCompletion,
             dailyPrioritySnapshots,
+            completedOperations: completed_operations,
             logs,
             error
         };
@@ -3545,7 +3539,7 @@ app.post('/api/schedule', async (req, res) => {
 
             // Strip recommendations (unused by frontend) to reduce payload size
             const { recommendations, ...trimmedResults } = results;
-            const projectCompletionTimeline = computeCompletionTimeline(projectTasks, completedTasks, results.finalSchedule, params.startDate);
+            const projectCompletionTimeline = computeCompletionTimeline(projectTasks, completedTasks, results.completedOperations, params.startDate);
 
             jobs[jobId].status = 'complete';
             jobs[jobId].progress = 100;
