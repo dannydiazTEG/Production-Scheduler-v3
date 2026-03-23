@@ -270,6 +270,91 @@ async function prepareProjectData(projectTasks, updateProgress) {
 }
 
 
+// --- Completion Timeline Computation ---
+function computeCompletionTimeline(projectTasks, completedTasks, finalSchedule, startDate) {
+    // 1. Total hours per project (from the original, unfiltered task list)
+    const projectInfo = {};
+    for (const task of projectTasks) {
+        const proj = task.Project;
+        if (!projectInfo[proj]) {
+            projectInfo[proj] = { totalHours: 0, store: task.Store || '' };
+        }
+        projectInfo[proj].totalHours += parseFloat(task['Estimated Hours']) || 0;
+    }
+
+    // 2. Build lookup from projectTasks to recover hours for Snowflake-completed tasks
+    const taskHoursLookup = {};
+    for (const task of projectTasks) {
+        const key = `${task.Project}|${task.SKU}|${task.Operation}`;
+        taskHoursLookup[key] = parseFloat(task['Estimated Hours']) || 0;
+    }
+
+    // Sum Snowflake-completed hours per project
+    const snowflakeHours = {};
+    for (const ct of (completedTasks || [])) {
+        const key = `${ct.Project}|${ct.SKU}|${ct.Operation}`;
+        const hours = taskHoursLookup[key] || 0;
+        snowflakeHours[ct.Project] = (snowflakeHours[ct.Project] || 0) + hours;
+    }
+
+    // 3. Daily scheduled hours from finalSchedule, grouped by project + date
+    const dailyByProject = {};
+    for (const entry of (finalSchedule || [])) {
+        const proj = entry.Project;
+        const date = entry.Date;
+        const hours = parseFloat(entry['Task Hours Completed']) || 0;
+        if (!dailyByProject[proj]) dailyByProject[proj] = {};
+        dailyByProject[proj][date] = (dailyByProject[proj][date] || 0) + hours;
+    }
+
+    // 4. Build timeline per project
+    const allDatesSet = new Set();
+    const projects = [];
+
+    for (const [proj, info] of Object.entries(projectInfo)) {
+        if (info.totalHours === 0) continue;
+
+        const sfHours = snowflakeHours[proj] || 0;
+        const dailyMap = dailyByProject[proj] || {};
+        const dates = Object.keys(dailyMap).sort();
+
+        const timeline = [];
+
+        // Starting point: Snowflake completion at schedule start
+        const startPct = (sfHours / info.totalHours) * 100;
+        timeline.push({
+            date: startDate,
+            completedHours: Math.round(sfHours * 100) / 100,
+            completionPct: Math.round(startPct * 10) / 10
+        });
+        allDatesSet.add(startDate);
+
+        // Accumulate daily work on top of the Snowflake base
+        let cumulative = sfHours;
+        for (const date of dates) {
+            cumulative += dailyMap[date];
+            const pct = (cumulative / info.totalHours) * 100;
+            timeline.push({
+                date,
+                completedHours: Math.round(cumulative * 100) / 100,
+                completionPct: Math.round(pct * 10) / 10
+            });
+            allDatesSet.add(date);
+        }
+
+        projects.push({
+            project: proj,
+            store: info.store,
+            totalHours: Math.round(info.totalHours * 100) / 100,
+            timeline
+        });
+    }
+
+    const allDates = [...allDatesSet].sort();
+    return { projects, dates: allDates };
+}
+
+
 // --- Core Scheduling Logic ---
 const runSchedulingEngine = async (
     preparedTasks, params, teamDefs, ptoEntries, teamMemberChanges,
@@ -279,6 +364,13 @@ const runSchedulingEngine = async (
 ) => {
     const logs = [];
     let error = '';
+
+    const PROJECT_TYPE_MULTIPLIERS = {
+        'NSO': 1.5,
+        'INFILL': 1.3,
+        'RENO': 1.15,
+        'PC': 1.0,
+    };
 
     const tasksWithOverrides = preparedTasks.map(task => {
         const newStartDate = startDateOverrides[task.Project];
@@ -772,7 +864,13 @@ const runSchedulingEngine = async (
                     }
                 }
 
-                task.DynamicPriority = (task.BasePriority * dueDateMultiplier * assemblyGroupMultiplier) / task.TeamCapacity;
+                // Project Type multiplier: NSO > Infill > RENO > PC
+                const projectTypeMultiplier = PROJECT_TYPE_MULTIPLIERS[(task.ProjectType || '').toUpperCase()] || 1.0;
+
+                task.DynamicPriority = (task.BasePriority * dueDateMultiplier * assemblyGroupMultiplier * projectTypeMultiplier) / task.TeamCapacity;
+                task._dueDateMultiplier = dueDateMultiplier;
+                task._assemblyGroupMultiplier = assemblyGroupMultiplier;
+                task._projectTypeMultiplier = projectTypeMultiplier;
             });
 
             // Capture priority snapshots weekly (Mondays) with top 50 tasks to keep response size manageable
@@ -793,9 +891,11 @@ const runSchedulingEngine = async (
                         Operation: t.Operation,
                         Team: t.Team,
                         Order: t.Order,
+                        ProjectType: t.ProjectType || 'NSO',
                         HoursRemaining: Number(t.HoursRemaining.toFixed(2)),
                         BasePriority: Number(t.BasePriority.toFixed(2)),
-                        DueDateMultiplier: Number(((t.DynamicPriority * t.TeamCapacity) / (t.BasePriority || 1)).toFixed(2)),
+                        DueDateMultiplier: Number((t._dueDateMultiplier || 1).toFixed(2)),
+                        ProjectTypeMultiplier: Number((t._projectTypeMultiplier || 1).toFixed(2)),
                         BottleneckMultiplier: 1,
                         DwellMultiplier: 1,
                         TeamCapacity: t.TeamCapacity,
@@ -3335,14 +3435,15 @@ app.post('/api/schedule', async (req, res) => {
 
             if (preparedTasks.length === 0) {
                 const combinedLogs = [...prepLogs, "All tasks for the submitted projects are already complete."];
+                const projectCompletionTimeline = computeCompletionTimeline(projectTasks, completedTasks, [], params.startDate);
                 jobs[jobId].status = 'complete';
                 jobs[jobId].progress = 100;
                 jobs[jobId].message = 'All tasks were already completed.';
                 jobs[jobId].step = 'done';
-                jobs[jobId].result = { 
+                jobs[jobId].result = {
                     finalSchedule: [], projectSummary: [], teamUtilization: [], weeklyOutput: [],
                     dailyCompletions: [], teamWorkload: [], recommendations: [],
-                    projectedCompletion: null, logs: combinedLogs, completedTasks, error: '' 
+                    projectedCompletion: null, logs: combinedLogs, completedTasks, projectCompletionTimeline, error: ''
                 };
                 return;
             }
@@ -3357,12 +3458,13 @@ app.post('/api/schedule', async (req, res) => {
             );
             
             const combinedLogs = [...prepLogs, ...(results.logs || [])];
-            
+            const projectCompletionTimeline = computeCompletionTimeline(projectTasks, completedTasks, results.finalSchedule, params.startDate);
+
             jobs[jobId].status = 'complete';
             jobs[jobId].progress = 100;
             jobs[jobId].message = 'Scheduling complete!';
             jobs[jobId].step = 'done';
-            jobs[jobId].result = { ...results, logs: combinedLogs, completedTasks };
+            jobs[jobId].result = { ...results, logs: combinedLogs, completedTasks, projectCompletionTimeline };
 
         } catch (e) {
             console.error(`[Job ${jobId}] Failed to run scheduling engine:`, e);
