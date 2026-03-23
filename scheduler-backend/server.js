@@ -297,10 +297,21 @@ async function prepareProjectData(projectTasks, updateProgress) {
 
 
 // --- Completion Timeline Computation (based on completed operations) ---
-function computeCompletionTimeline(projectTasks, completedTasks, completedOperations, startDate) {
-    // 1. Total operations per project (each task in projectTasks = one operation)
+function computeCompletionTimeline(projectTasks, completedTasks, completedOperations, startDate, teamMapping, teamsToIgnore) {
+    // Build team assignment lookup (same logic as assignTeams in the engine)
+    const teamMap = (teamMapping || []).reduce((acc, curr) => ({ ...acc, [curr.operation]: curr.team }), {});
+    const ignoredTeams = new Set((teamsToIgnore || '').split(',').map(t => t.trim()).filter(Boolean));
+
+    const getTeam = (operation) => {
+        if ((operation || '').toLowerCase().includes('kitting')) return 'Receiving';
+        return teamMap[operation] || 'Unassigned';
+    };
+    const isIgnored = (operation) => ignoredTeams.has(getTeam(operation));
+
+    // 1. Total operations per project (excluding ignored teams)
     const projectInfo = {};
     for (const task of projectTasks) {
+        if (isIgnored(task.Operation)) continue;
         const proj = task.Project;
         if (!projectInfo[proj]) {
             projectInfo[proj] = { totalOps: 0, store: task.Store || '' };
@@ -308,9 +319,10 @@ function computeCompletionTimeline(projectTasks, completedTasks, completedOperat
         projectInfo[proj].totalOps += 1;
     }
 
-    // 2. Snowflake-completed operation count per project
+    // 2. Snowflake-completed operation count per project (excluding ignored teams)
     const snowflakeOps = {};
     for (const ct of (completedTasks || [])) {
+        if (isIgnored(ct.Operation)) continue;
         snowflakeOps[ct.Project] = (snowflakeOps[ct.Project] || 0) + 1;
     }
 
@@ -3504,7 +3516,7 @@ app.post('/api/schedule', async (req, res) => {
 
             if (preparedTasks.length === 0) {
                 const combinedLogs = [...prepLogs, "All tasks for the submitted projects are already complete."];
-                const projectCompletionTimeline = computeCompletionTimeline(projectTasks, completedTasks, [], params.startDate);
+                const projectCompletionTimeline = computeCompletionTimeline(projectTasks, completedTasks, [], params.startDate, teamDefs.mapping, params.teamsToIgnore);
                 jobs[jobId].status = 'complete';
                 jobs[jobId].progress = 100;
                 jobs[jobId].message = 'All tasks were already completed.';
@@ -3539,7 +3551,7 @@ app.post('/api/schedule', async (req, res) => {
 
             // Strip recommendations (unused by frontend) to reduce payload size
             const { recommendations, ...trimmedResults } = results;
-            const projectCompletionTimeline = computeCompletionTimeline(projectTasks, completedTasks, results.completedOperations, params.startDate);
+            const projectCompletionTimeline = computeCompletionTimeline(projectTasks, completedTasks, results.completedOperations, params.startDate, teamDefs.mapping, params.teamsToIgnore);
 
             jobs[jobId].status = 'complete';
             jobs[jobId].progress = 100;
