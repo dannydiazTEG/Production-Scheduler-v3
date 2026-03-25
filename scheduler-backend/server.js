@@ -326,9 +326,10 @@ function computeCompletionTimeline(projectTasks, completedTasks, completedOperat
         snowflakeOps[ct.Project] = (snowflakeOps[ct.Project] || 0) + 1;
     }
 
-    // 3. Scheduled operation completions per project per date
+    // 3. Scheduled operation completions per project per date (excluding ignored teams)
     const dailyByProject = {};
     for (const op of (completedOperations || [])) {
+        if (isIgnored(op.Operation)) continue;
         const proj = op.Project;
         const date = formatDate(op.CompletionDate);
         if (!date) continue;
@@ -355,7 +356,7 @@ function computeCompletionTimeline(projectTasks, completedTasks, completedOperat
             date: startDate,
             completedOps: sfOps,
             totalOps: info.totalOps,
-            completionPct: Math.round(startPct * 10) / 10
+            completionPct: Math.min(Math.round(startPct * 10) / 10, 100)
         });
         allDatesSet.add(startDate);
 
@@ -368,7 +369,7 @@ function computeCompletionTimeline(projectTasks, completedTasks, completedOperat
                 date,
                 completedOps: cumulative,
                 totalOps: info.totalOps,
-                completionPct: Math.round(pct * 10) / 10
+                completionPct: Math.min(Math.round(pct * 10) / 10, 100)
             });
             allDatesSet.add(date);
         }
@@ -1150,7 +1151,7 @@ const runSchedulingEngine = async (
                                             totalHoursCompleted += task_hours_to_complete;
 
                                             if (taskInArray.HoursRemaining <= 0.01) {
-                                                completed_operations.push({ Project: task_to_assign.Project, SKU: task_to_assign.SKU, Order: task_to_assign.Order, TaskID: task_to_assign.TaskID, CompletionDate: new Date(current_date) });
+                                                completed_operations.push({ Project: task_to_assign.Project, SKU: task_to_assign.SKU, Order: task_to_assign.Order, TaskID: task_to_assign.TaskID, Operation: task_to_assign.Operation, CompletionDate: new Date(current_date) });
                                                 completedTaskIDs.add(task_to_assign.TaskID);
                                                 if (taskInArray.Order === skuMaxOrderMap[taskInArray.SKU]) {
                                                     const skuKey = `${taskInArray.Project}|${taskInArray.SKU}`;
