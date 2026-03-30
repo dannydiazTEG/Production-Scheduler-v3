@@ -777,6 +777,11 @@ const runSchedulingEngine = async (
 
         const yieldToEventLoop = () => new Promise(resolve => setTimeout(resolve, 0));
 
+        // Dwell time tracking: records when the first operation at a given Order level
+        // completes for each SKU, so we can boost priority of remaining concurrent siblings
+        const firstCompletionByOrder = new Map(); // key: "Project|SKU|Order" -> Date
+        const maxIdleDays = parseFloat(params.maxIdleDays) || 7;
+
         while(unscheduled_tasks.length > 0 && loopCounter < maxDays) {
             const dayOfWeek = current_date.getDay();
             const currentDateStr = formatDate(current_date);
@@ -898,10 +903,24 @@ const runSchedulingEngine = async (
                 // Project Type multiplier: NSO > Infill > RENO > PC
                 const projectTypeMultiplier = PROJECT_TYPE_MULTIPLIERS[(task.ProjectType || '').toUpperCase()] || 1.0;
 
-                task.DynamicPriority = (task.BasePriority * dueDateMultiplier * assemblyGroupMultiplier * projectTypeMultiplier) / task.TeamCapacity;
+                // Dwell time multiplier: boost priority when a concurrent sibling at the same
+                // Order level has already completed and this task is still waiting
+                let dwellMultiplier = 1.0;
+                const dwellOrderKey = `${task.Project}|${task.SKU}|${task.Order}`;
+                const firstSiblingCompletion = firstCompletionByOrder.get(dwellOrderKey);
+                if (firstSiblingCompletion) {
+                    const dwellDays = (current_date - firstSiblingCompletion) / (1000 * 60 * 60 * 24);
+                    if (dwellDays > maxIdleDays) {
+                        dwellMultiplier = 1 + ((dwellDays - maxIdleDays) / maxIdleDays);
+                        dwellMultiplier = Math.min(dwellMultiplier, 3.0); // Cap at 3x
+                    }
+                }
+
+                task.DynamicPriority = (task.BasePriority * dueDateMultiplier * assemblyGroupMultiplier * projectTypeMultiplier * dwellMultiplier) / task.TeamCapacity;
                 task._dueDateMultiplier = dueDateMultiplier;
                 task._assemblyGroupMultiplier = assemblyGroupMultiplier;
                 task._projectTypeMultiplier = projectTypeMultiplier;
+                task._dwellMultiplier = dwellMultiplier;
             });
 
             // Capture priority snapshots weekly (Mondays) with top 50 tasks to keep response size manageable
@@ -928,7 +947,7 @@ const runSchedulingEngine = async (
                         DueDateMultiplier: Number((t._dueDateMultiplier || 1).toFixed(2)),
                         ProjectTypeMultiplier: Number((t._projectTypeMultiplier || 1).toFixed(2)),
                         BottleneckMultiplier: 1,
-                        DwellMultiplier: 1,
+                        DwellMultiplier: Number((t._dwellMultiplier || 1).toFixed(2)),
                         TeamCapacity: t.TeamCapacity,
                         DynamicPriority: Number(t.DynamicPriority.toFixed(2)),
                         DaysUntilDue: daysUntilDue,
@@ -1152,6 +1171,11 @@ const runSchedulingEngine = async (
                                             if (taskInArray.HoursRemaining <= 0.01) {
                                                 completed_operations.push({ Project: task_to_assign.Project, SKU: task_to_assign.SKU, Order: task_to_assign.Order, TaskID: task_to_assign.TaskID, CompletionDate: new Date(current_date) });
                                                 completedTaskIDs.add(task_to_assign.TaskID);
+                                                // Track first completion at this Order level for dwell time boosting
+                                                const dwellOrderKey = `${taskInArray.Project}|${taskInArray.SKU}|${taskInArray.Order}`;
+                                                if (!firstCompletionByOrder.has(dwellOrderKey)) {
+                                                    firstCompletionByOrder.set(dwellOrderKey, new Date(current_date));
+                                                }
                                                 if (taskInArray.Order === skuMaxOrderMap[taskInArray.SKU]) {
                                                     const skuKey = `${taskInArray.Project}|${taskInArray.SKU}`;
                                                     const finalSkuValue = skuValueMap[skuKey] || 0;
