@@ -659,7 +659,7 @@ const runSchedulingEngine = async (
                         Operation: t.Operation,
                         Team: t.Team,
                         Order: t.Order,
-                        ProjectType: t.ProjectType || 'NSO',
+                        ProjectType: t.ProjectType || '',
                         HoursRemaining: Number(t.HoursRemaining.toFixed(2)),
                         BasePriority: Number(t.BasePriority.toFixed(2)),
                         DueDateMultiplier: Number((t._dueDateMultiplier || 1).toFixed(2)),
