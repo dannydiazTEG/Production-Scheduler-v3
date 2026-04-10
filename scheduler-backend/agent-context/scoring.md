@@ -1,85 +1,120 @@
 # Scoring — How Results Are Evaluated
 
-## Composite Score Formula
+## Composite Score (0-100, higher = better)
 
-```
-score = (totalLateness * 1000) + (overtimeHours * 1.0) + (utilizationStdDev * 10) + (dwellDays * 0.5)
-```
+Four weighted categories, each scored independently and summed:
 
-**Lower is better.** A score of 0 means: zero days late anywhere, zero overtime, perfectly balanced teams, zero idle dwell time.
+### NSO/Infill Completion Buffer — 40 points max
+Each NSO/Infill store is scored individually, then averaged and scaled to 40 points.
 
-## Score Breakdown
+**Buffer curve (days early → % of max):**
+| Days Early | Score | Why |
+|-----------|-------|-----|
+| Late | 0% | Hard gate should catch this |
+| 0 (on due date) | 60% | On time but no safety margin |
+| 1 day | 70% | Minimal buffer |
+| 2 days | 80% | Getting comfortable |
+| 3 days | 87% | Sweet spot starts |
+| 4 days | 93% | Near optimal |
+| **5 days** | **100%** | **Optimal — peak score** |
+| 6 days | 97% | Slightly pulling work forward |
+| 8 days | 91% | Diminishing |
+| 10 days | 85% | Pulling too much forward |
+| 15 days | 78% | Unnecessarily early |
 
-### `totalLateness` (weight: 1000x)
-- Sum of days late across ALL stores (not just NSO)
-- Measured against **store-level production due dates** from the Dates CSV
-- Each store's "finish date" is the latest operation completion date across all projects for that store
-- A store that finishes 5 days late contributes 5 to totalLateness
-- **This dominates the score** — reducing lateness by 1 day saves 1000 points
+**This is the biggest lever.** Baseline scores 26.3/40 — moving stores from "on the due date" to "3-5 days early" is the fastest path to improvement.
 
-### `feasible` (hard gate)
-- `true` if ALL NSO stores finish on or before their production due date
-- `false` if ANY NSO store is late — the configuration should be discarded
-- Non-NSO stores (INFILL, RENO, PC) can be late without breaking feasibility
-- **Only feasible configurations should be considered as "best"**
+### Labor Efficiency — 30 points max
+`Output Value ÷ Total Paid Hours`. Value is realized when QC completes each SKU, using prices from the database (`raw_fulcrum_price_breaks` table).
 
-### `nsoViolations` (detail for infeasible configs)
-- Array of `{ store, dueDate, finishDate, latenessDays }` for each NSO store that missed its deadline
-- Use this to understand which NSO stores are hardest to satisfy
-- A config might fix 3 out of 4 NSO violations — that's progress even if infeasible
+- $93/hr = 20 out of 30 points (baseline target)
+- Every dollar above $93 earns proportionally more (asymptotic curve)
+- Below $93 scales down proportionally
+- Baseline measures at $109.67/hr = 25.4/30
 
-### `overtimeHours` (weight: 1.0x)
-- Total hours where team worked > capacity in any given week
-- Driven by `workHourOverrides` setting hours > standard
-- 100 overtime hours adds 100 to the score
-- **Only matters as a tiebreaker** when lateness is similar
+### Labor Cost — 20 points max
+Minimize overtime hours. OT premium = $45.81/hr.
 
-### `utilizationStdDev` (weight: 10x)
-- Standard deviation of average team utilization across all weeks
-- Measures how evenly work is distributed across teams
-- A StdDev of 0.15 (15 percentage points) adds 1.5 to the score
-- **Indicates bottleneck imbalance** — if one team is at 95% while another is at 30%, the StdDev is high
-- Useful signal for where to add headcount or shift work
+- 0 overtime hours = 20/20 (full marks)
+- Every 100 OT hours drops ~5 points
+- Baseline has 0 OT = 20/20
 
-### `dwellDays` (weight: 0.5x)
-- Total calendar days items sat idle between consecutive operations
-- Computed from gaps in the finalSchedule (operation N finishes on day X, operation N+1 starts on day Y, gap = Y - X - 1)
-- 200 dwell days adds 100 to the score
-- **Indicates coordination issues** — upstream teams finishing faster than downstream can absorb
+**Tradeoff:** Adding overtime can improve buffer scores (finishing earlier) but costs labor cost points. The optimizer should find the balance.
 
-## `storeBreakdown` Array
+### Reno/PC Adherence — 10 points max
+Non-critical project types can flex up to 14 days late with a sliding penalty.
 
-Each entry:
+| Days Late | Score |
+|----------|-------|
+| 0 (on time) | 100% |
+| 7 days | 75% |
+| 14 days | 50% |
+| 21+ days | Steep drop toward 0% |
+
+Baseline scores 9.7/10.
+
+## Hard Gate: NSO/Infill Feasibility
+
+NSO and Infill stores have a **sliding tolerance** based on distance from today:
+| Due Date Distance | Tolerance |
+|------------------|-----------|
+| 0-1 months | 0 days |
+| 2-3 months | 3 days |
+| 4-6 months | 5 days |
+| 7+ months | Up to 10 days (capped) |
+
+A store that exceeds its tolerance makes the config `feasible: false`. Stores within tolerance are logged as `nsoWarnings` but don't block feasibility.
+
+**Only feasible configurations should be considered as "best."**
+
+## Letter Grades
+
+| Score | Grade |
+|-------|-------|
+| 90+ | A+ |
+| 85-89 | A |
+| 80-84 | A- |
+| 75-79 | B+ |
+| 70-74 | B |
+| 65-69 | B- |
+| 55-64 | C |
+| <55 (feasible) | D |
+| Infeasible | D or F |
+
+## Team Health (in response but not scored)
+
+**Workload Peaks:** Teams over 150% capacity in a given week (excluding Receiving & QC). Indicates backlog building up. Example: Paint at 400% means 4x more work assigned than the team can handle that week.
+
+**Utilization Valleys:** Teams below 40% utilization (excluding Receiving & QC). Indicates idle capacity — potential flex or cross-training opportunities.
+
+## Response Shape
+
 ```json
 {
-    "store": "Denver",
-    "matchedStore": "Denver",      // Matched name from Dates CSV
-    "projectTypes": ["NSO"],
-    "finishDate": "2026-07-15",
-    "dueDate": "2026-07-10",
-    "latenessDays": 5,
-    "isNso": true,
-    "status": "LATE"
+    "compositeScore": 81.4,
+    "grade": "A-",
+    "gradeSummary": "Solid schedule, minor room for improvement",
+    "feasible": true,
+    "onTimeRate": "31/37 (84%)",
+    "totalLateness": 24,
+    "categories": {
+        "buffer": 26.3, "bufferMax": 40,
+        "laborEfficiency": 25.4, "laborEfficiencyMax": 30,
+        "laborCost": 20, "laborCostMax": 20,
+        "adherence": 9.7, "adherenceMax": 10
+    },
+    "labor": {
+        "totalOutputValue": 12500.00,
+        "totalPaidHours": 350.0,
+        "efficiencyPerHour": 109.67,
+        "efficiencyBaseline": 93,
+        "overtimeHours": 0,
+        "overtimeCost": 0,
+        "otPremiumRate": 45.81
+    },
+    "nsoViolations": [],
+    "nsoWarnings": [{"store": "Raleigh NC", "latenessDays": 1, "toleranceDays": 6}],
+    "storeBreakdown": [...],
+    "teamHealth": { "peaks": [...], "valleys": [...] }
 }
 ```
-
-Sorted by latenessDays descending — the worst stores are first. Use this to identify which stores to focus on.
-
-## Interpreting Results
-
-| Score Range | Meaning |
-|-------------|---------|
-| 0 | Perfect — all on-time, no OT, balanced, no dwell |
-| 1-999 | Excellent — no lateness, minor secondary issues |
-| 1000-5000 | Good but late — 1-5 total store-days of lateness |
-| 5000-20000 | Significant lateness — 5-20 store-days late |
-| 20000+ | Major issues — widespread lateness |
-| Infinity | Engine error — check `engineError` field |
-
-## Common Patterns
-
-- **Score drops from 15000 to 5000 by adjusting one team's headcount** → that team was the bottleneck
-- **Score barely changes despite big parameter swings** → those parameters don't affect the binding constraint
-- **Feasibility flips from false to true** → you found the threshold for the hardest NSO store
-- **overtimeHours increases but totalLateness drops** → OT is "buying" on-time delivery (intended tradeoff)
-- **utilizationStdDev decreases but score increases** → you balanced teams but at the cost of throughput
