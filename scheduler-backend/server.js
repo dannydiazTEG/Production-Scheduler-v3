@@ -2613,7 +2613,7 @@ app.post('/api/optimize-run', async (req, res) => {
 
                 const storeDueDates = parseDatesCsv(storeDueDatesCsv);
                 jobs[jobId].result = {
-                    score: { score: Infinity, feasible: false, totalLateness: Infinity, nsoViolations: [{ store: 'ENGINE_ERROR', reason: engineResult.error }], overtimeHours: 0, utilizationStdDev: 0, dwellDays: 0, storeBreakdown: [] },
+                    score: { compositeScore: 0, grade: 'F', gradeSummary: 'Engine error', feasible: false, totalLateness: Infinity, nsoViolations: [{ store: 'ENGINE_ERROR', reason: engineResult.error }], categories: { buffer: 0, laborEfficiency: 0, laborCost: 0, adherence: 0 }, storeBreakdown: [] },
                     projectSummary: [],
                     teamUtilization: [],
                     weeklyOutput: [],
@@ -2628,13 +2628,33 @@ app.post('/api/optimize-run', async (req, res) => {
             // Score the result
             updateProgress(90, 'Scoring result...', 'scoring');
             const storeDueDates = parseDatesCsv(storeDueDatesCsv);
-            const scoreData = scoreResult(engineResult, storeDueDates, parseFloat(params.hoursPerDay) || 8);
+
+            // Fetch SKU prices from database for labor efficiency scoring
+            let priceMap = new Map();
+            try {
+                if (pgPool) {
+                    const priceResult = await pgPool.query('SELECT item_reference_name, price FROM raw_fulcrum_price_breaks');
+                    for (const row of priceResult.rows) {
+                        if (row.item_reference_name && row.price != null) {
+                            priceMap.set(row.item_reference_name, parseFloat(row.price) || 0);
+                        }
+                    }
+                    console.log(`[Job ${jobId}] Loaded ${priceMap.size} SKU prices from price break table.`);
+                }
+            } catch (priceErr) {
+                console.warn(`[Job ${jobId}] Could not load prices: ${priceErr.message}. Labor efficiency will use CSV values.`);
+            }
+
+            const scoreData = scoreResult(engineResult, storeDueDates, {
+                standardHoursPerDay: parseFloat(params.hoursPerDay) || 8,
+                priceMap,
+            });
             const projectTypeMap = extractProjectTypeMap(engineResult.finalSchedule || []);
             const trimmed = trimEngineResult(engineResult);
 
             jobs[jobId].status = 'complete';
             jobs[jobId].progress = 100;
-            jobs[jobId].message = `Score: ${scoreData.score} | Feasible: ${scoreData.feasible} | Lateness: ${scoreData.totalLateness}d`;
+            jobs[jobId].message = `Score: ${scoreData.compositeScore}/100 (${scoreData.grade}) | Feasible: ${scoreData.feasible} | Lateness: ${scoreData.totalLateness}d`;
             jobs[jobId].step = 'done';
             jobs[jobId].result = {
                 score: scoreData,
@@ -2654,7 +2674,7 @@ app.post('/api/optimize-run', async (req, res) => {
                 logs: (trimmed.logs || []).slice(-30)
             };
 
-            console.log(`[Job ${jobId}] Optimize-run complete. Score: ${scoreData.score}, Feasible: ${scoreData.feasible}`);
+            console.log(`[Job ${jobId}] Optimize-run complete. Score: ${scoreData.compositeScore}/100 (${scoreData.grade}), Feasible: ${scoreData.feasible}`);
 
         } catch (e) {
             console.error(`[Job ${jobId}] optimize-run failed:`, e);

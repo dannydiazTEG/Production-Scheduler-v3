@@ -23,39 +23,74 @@ function createTransporter() {
  * Generate the executive summary HTML section.
  */
 function renderExecutiveSummary(baseline, best, totalIterations, durationMinutes) {
-    const improvement = baseline.score === Infinity || baseline.score === 0
+    const baseScore = baseline.compositeScore || baseline.score || 0;
+    const bestScoreVal = best.compositeScore || best.score || 0;
+    const improvement = baseScore === 0
         ? 'N/A'
-        : `${((1 - best.score / baseline.score) * 100).toFixed(1)}%`;
+        : `${baseScore.toFixed(1)} → ${bestScoreVal.toFixed(1)} / 100`;
 
-    const nsoStatus = best.feasible
-        ? '<span style="color: #16a34a; font-weight: bold;">ALL NSO DEADLINES MET</span>'
-        : `<span style="color: #dc2626; font-weight: bold;">${best.nsoViolations.length} NSO STORE(S) LATE</span>`;
+    // Grade badge color
+    const gradeColors = { 'A+': '#16a34a', 'A': '#16a34a', 'A-': '#22c55e', 'B+': '#3b82f6', 'B': '#3b82f6', 'B-': '#60a5fa', 'C': '#f59e0b', 'D+': '#f97316', 'D': '#ef4444', 'F': '#dc2626' };
+    const gradeColor = gradeColors[best.grade] || '#64748b';
+
+    // NSO status line
+    let nsoLine;
+    if (best.feasible && (best.nsoWithinTolerance || 0) === 0) {
+        nsoLine = '<span style="color: #16a34a; font-weight: bold;">ALL NSO ON TIME</span>';
+    } else if (best.feasible) {
+        nsoLine = `<span style="color: #16a34a; font-weight: bold;">ALL NSO WITHIN TOLERANCE</span> <span style="color: #64748b;">(${best.nsoWithinTolerance} store(s) late but within allowed window)</span>`;
+    } else {
+        nsoLine = `<span style="color: #dc2626; font-weight: bold;">${best.nsoViolations.length} NSO STORE(S) EXCEED TOLERANCE</span>`;
+        if ((best.nsoWithinTolerance || 0) > 0) {
+            nsoLine += ` <span style="color: #64748b;">(${best.nsoWithinTolerance} other(s) within tolerance)</span>`;
+        }
+    }
 
     return `
     <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 24px; margin-bottom: 24px;">
-        <h2 style="margin-top: 0; color: #1e293b;">Optimization Summary</h2>
+        <div style="display: flex; align-items: center; margin-bottom: 16px;">
+            <div style="background: ${gradeColor}; color: white; font-size: 28px; font-weight: bold; width: 56px; height: 56px; border-radius: 8px; display: flex; align-items: center; justify-content: center; margin-right: 16px;">${best.grade || '?'}</div>
+            <div>
+                <h2 style="margin: 0; color: #1e293b; font-size: 18px;">Schedule Optimization Results</h2>
+                <p style="margin: 2px 0 0; color: #64748b; font-size: 14px;">${best.gradeSummary || ''}</p>
+            </div>
+        </div>
         <table style="width: 100%; border-collapse: collapse;">
             <tr>
-                <td style="padding: 8px 16px 8px 0; color: #64748b;">Score Improvement</td>
-                <td style="padding: 8px 0; font-weight: bold; color: #1e293b;">${baseline.score.toLocaleString()} &rarr; ${best.score.toLocaleString()} (${improvement} better)</td>
+                <td style="padding: 8px 16px 8px 0; color: #64748b;">Composite Score</td>
+                <td style="padding: 8px 0; font-weight: bold;">${improvement}</td>
             </tr>
             <tr>
-                <td style="padding: 8px 16px 8px 0; color: #64748b;">NSO Deadline Status</td>
-                <td style="padding: 8px 0;">${nsoStatus}</td>
+                <td style="padding: 8px 16px 8px 0; color: #64748b;">On-Time Delivery</td>
+                <td style="padding: 8px 0; font-weight: bold;">${best.onTimeRate || 'N/A'}</td>
             </tr>
             <tr>
-                <td style="padding: 8px 16px 8px 0; color: #64748b;">Total Lateness</td>
-                <td style="padding: 8px 0; font-weight: bold;">${baseline.totalLateness}d &rarr; ${best.totalLateness}d</td>
+                <td style="padding: 8px 16px 8px 0; color: #64748b;">NSO/Infill Status</td>
+                <td style="padding: 8px 0;">${nsoLine}</td>
+            </tr>
+            ${best.categories ? `
+            <tr>
+                <td style="padding: 8px 16px 8px 0; color: #64748b;">NSO/Infill Buffer</td>
+                <td style="padding: 8px 0;">${best.categories.buffer}/${best.categories.bufferMax} pts</td>
             </tr>
             <tr>
-                <td style="padding: 8px 16px 8px 0; color: #64748b;">Overtime Hours</td>
-                <td style="padding: 8px 0;">${baseline.overtimeHours}h &rarr; ${best.overtimeHours}h</td>
+                <td style="padding: 8px 16px 8px 0; color: #64748b;">Labor Efficiency</td>
+                <td style="padding: 8px 0;">${best.categories.laborEfficiency}/${best.categories.laborEfficiencyMax} pts${best.labor ? ` ($${best.labor.efficiencyPerHour}/hr vs $${best.labor.efficiencyBaseline} target)` : ''}</td>
             </tr>
             <tr>
-                <td style="padding: 8px 16px 8px 0; color: #64748b;">Iterations / Duration</td>
-                <td style="padding: 8px 0;">${totalIterations} runs in ${durationMinutes} min</td>
+                <td style="padding: 8px 16px 8px 0; color: #64748b;">Labor Cost (OT)</td>
+                <td style="padding: 8px 0;">${best.categories.laborCost}/${best.categories.laborCostMax} pts${best.labor ? ` (${best.labor.overtimeHours}h OT, $${best.labor.overtimeCost.toLocaleString()})` : ''}</td>
+            </tr>
+            <tr>
+                <td style="padding: 8px 16px 8px 0; color: #64748b;">Reno/PC Adherence</td>
+                <td style="padding: 8px 0;">${best.categories.adherence}/${best.categories.adherenceMax} pts</td>
+            </tr>` : ''}
+            <tr>
+                <td style="padding: 8px 16px 8px 0; color: #64748b;">Optimization Runs</td>
+                <td style="padding: 8px 0;">${totalIterations} iterations in ${durationMinutes} min</td>
             </tr>
         </table>
+        <p style="margin: 12px 0 0; padding: 8px 12px; background: #fefce8; border-radius: 4px; font-size: 12px; color: #854d0e;">${best.nsoToleranceNote || ''}</p>
     </div>`;
 }
 
@@ -66,7 +101,23 @@ function renderStoreTable(storeBreakdown) {
     if (!storeBreakdown || storeBreakdown.length === 0) return '';
 
     const rows = storeBreakdown.map(s => {
-        const statusColor = s.status === 'LATE' ? '#dc2626' : s.status === 'ON_TIME' ? '#16a34a' : '#94a3b8';
+        let statusColor, statusText;
+        if (s.nsoStatus === 'WITHIN_TOLERANCE') {
+            statusColor = '#f59e0b'; // amber
+            statusText = `+${s.latenessDays}d <span style="font-size: 11px; font-weight: normal; color: #92400e;">(within ${s.toleranceDays}d tolerance)</span>`;
+        } else if (s.nsoStatus === 'EXCEEDS_TOLERANCE') {
+            statusColor = '#dc2626'; // red
+            statusText = `+${s.latenessDays}d <span style="font-size: 11px; font-weight: normal; color: #dc2626;">(exceeds ${s.toleranceDays}d tolerance)</span>`;
+        } else if (s.latenessDays > 0) {
+            statusColor = '#dc2626';
+            statusText = `+${s.latenessDays}d`;
+        } else if (s.status === 'ON_TIME') {
+            statusColor = '#16a34a';
+            statusText = 'On Time';
+        } else {
+            statusColor = '#94a3b8';
+            statusText = '-';
+        }
         const nsoTag = s.isNso ? ' <span style="background: #fef3c7; color: #92400e; padding: 2px 6px; border-radius: 4px; font-size: 11px;">NSO</span>' : '';
         return `
         <tr>
@@ -74,9 +125,7 @@ function renderStoreTable(storeBreakdown) {
             <td style="padding: 8px; border-bottom: 1px solid #e2e8f0;">${(s.projectTypes || []).join(', ')}</td>
             <td style="padding: 8px; border-bottom: 1px solid #e2e8f0;">${s.dueDate || 'N/A'}</td>
             <td style="padding: 8px; border-bottom: 1px solid #e2e8f0;">${s.finishDate}</td>
-            <td style="padding: 8px; border-bottom: 1px solid #e2e8f0; color: ${statusColor}; font-weight: bold;">
-                ${s.latenessDays > 0 ? `+${s.latenessDays}d` : s.status === 'ON_TIME' ? 'On Time' : '-'}
-            </td>
+            <td style="padding: 8px; border-bottom: 1px solid #e2e8f0; color: ${statusColor}; font-weight: bold;">${statusText}</td>
         </tr>`;
     }).join('');
 
@@ -184,6 +233,53 @@ function buildReportHtml(data, includeDetails) {
             { headcounts: baselineScore._baselineHeadcounts, priorityWeights: {}, params: baselineScore._baselineParams, workHourOverrides: [] },
             bestConfig
         );
+
+        // Workload ratio peaks (teams over capacity)
+        if (bestScore.teamHealth?.peaks?.length > 0) {
+            const topPeaks = bestScore.teamHealth.peaks.slice(0, 15);
+            const peakRows = topPeaks.map(p => {
+                const ratioColor = p.workloadRatio >= 300 ? '#dc2626' : p.workloadRatio >= 200 ? '#f97316' : '#f59e0b';
+                return `
+                <tr>
+                    <td style="padding: 6px 8px; border-bottom: 1px solid #e2e8f0;">${p.team}</td>
+                    <td style="padding: 6px 8px; border-bottom: 1px solid #e2e8f0;">${p.week}</td>
+                    <td style="padding: 6px 8px; border-bottom: 1px solid #e2e8f0; color: ${ratioColor}; font-weight: bold;">${p.workloadRatio}%</td>
+                </tr>`;
+            }).join('');
+            html += `
+            <h3 style="color: #1e293b;">Workload Peaks <span style="font-weight: normal; color: #64748b; font-size: 13px;">(teams over 150% capacity, excl. Receiving &amp; QC)</span></h3>
+            <p style="color: #64748b; font-size: 13px; margin-top: 0;">Teams with more work assigned than they can handle in a given week. Higher % = more backlog building up.</p>
+            <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                <thead><tr style="background: #f1f5f9;">
+                    <th style="padding: 6px 8px; text-align: left;">Team</th>
+                    <th style="padding: 6px 8px; text-align: left;">Week</th>
+                    <th style="padding: 6px 8px; text-align: left;">Workload Ratio</th>
+                </tr></thead>
+                <tbody>${peakRows}</tbody>
+            </table>`;
+        }
+
+        // Utilization valleys (teams with low utilization)
+        if (bestScore.teamHealth?.valleys?.length > 0) {
+            const topValleys = bestScore.teamHealth.valleys.slice(0, 15);
+            const valleyRows = topValleys.map(v => `
+                <tr>
+                    <td style="padding: 6px 8px; border-bottom: 1px solid #e2e8f0;">${v.team}</td>
+                    <td style="padding: 6px 8px; border-bottom: 1px solid #e2e8f0;">${v.week}</td>
+                    <td style="padding: 6px 8px; border-bottom: 1px solid #e2e8f0; color: #3b82f6; font-weight: bold;">${v.utilization}%</td>
+                </tr>`).join('');
+            html += `
+            <h3 style="color: #1e293b;">Utilization Valleys <span style="font-weight: normal; color: #64748b; font-size: 13px;">(teams below 40%, excl. Receiving &amp; QC)</span></h3>
+            <p style="color: #64748b; font-size: 13px; margin-top: 0;">Weeks where teams have significant idle capacity. Potential flex or cross-training opportunities.</p>
+            <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                <thead><tr style="background: #f1f5f9;">
+                    <th style="padding: 6px 8px; text-align: left;">Team</th>
+                    <th style="padding: 6px 8px; text-align: left;">Week</th>
+                    <th style="padding: 6px 8px; text-align: left;">Utilization</th>
+                </tr></thead>
+                <tbody>${valleyRows}</tbody>
+            </table>`;
+        }
 
         if (strategistNotes) {
             html += `
