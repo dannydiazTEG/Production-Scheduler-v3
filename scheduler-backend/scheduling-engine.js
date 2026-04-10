@@ -34,7 +34,13 @@ const DEFAULT_PRIORITY_WEIGHTS = {
     assemblyLeadBoost: 1.3,        // Priority boost for lead SKU pre-assembly work
     assemblyNonLeadHoldback: 0.75, // Priority reduction for non-lead SKU work
 
-    // Dwell time (idle concurrent operations)
+    // In-progress boost — tasks actively being worked on in Fulcrum
+    inProgressBoost: 5.0,      // Priority multiplier for Running/Paused operations
+
+    // Past-due linear transition — exponential growth switches to linear after this many days
+    pastDueLinearThreshold: 30, // Days past due before switching to linear growth
+
+    // Dwell time (idle sequential operations)
     dwellThresholdDays: 7,     // Days before dwell boost kicks in
     dwellCap: 3.0,             // Maximum dwell multiplier
 
@@ -495,9 +501,9 @@ const runSchedulingEngine = async (
 
         const yieldToEventLoop = () => new Promise(resolve => setTimeout(resolve, 0));
 
-        // Dwell time tracking: records when the first operation at a given Order level
-        // completes for each SKU, so we can boost priority of remaining concurrent siblings
-        const firstCompletionByOrder = new Map(); // key: "Project|SKU|Order" -> Date
+        // Dwell time tracking: records when each operation completes per SKU+Order,
+        // so we can boost priority of tasks waiting too long after their predecessor finished
+        const completionBySkuOrder = new Map(); // key: "Project|SKU|Order" -> Date
         const maxIdleDays = parseFloat(params.maxIdleDays) || weights.dwellThresholdDays;
 
         while(unscheduled_tasks.length > 0 && loopCounter < maxDays) {
@@ -602,7 +608,16 @@ const runSchedulingEngine = async (
                 const daysUntilDue = (task.DueDate - current_date) / (1000 * 60 * 60 * 24);
                 let dueDateMultiplier;
                 if (daysUntilDue < 0) {
-                    dueDateMultiplier = weights.pastDueBase * Math.pow(weights.pastDueGrowthRate, -daysUntilDue);
+                    const daysPastDue = -daysUntilDue;
+                    if (daysPastDue <= weights.pastDueLinearThreshold) {
+                        // Exponential growth for recently past-due tasks
+                        dueDateMultiplier = weights.pastDueBase * Math.pow(weights.pastDueGrowthRate, daysPastDue);
+                    } else {
+                        // Linear growth beyond threshold — prevents overflow while maintaining urgency
+                        const valueAtThreshold = weights.pastDueBase * Math.pow(weights.pastDueGrowthRate, weights.pastDueLinearThreshold);
+                        const slopeAtThreshold = weights.pastDueBase * Math.log(weights.pastDueGrowthRate) * Math.pow(weights.pastDueGrowthRate, weights.pastDueLinearThreshold);
+                        dueDateMultiplier = valueAtThreshold + slopeAtThreshold * (daysPastDue - weights.pastDueLinearThreshold);
+                    }
                 } else {
                     dueDateMultiplier = 1 + (weights.dueDateNumerator / (daysUntilDue + 1));
                 }
@@ -621,24 +636,36 @@ const runSchedulingEngine = async (
                 // Project Type multiplier: NSO > Infill > RENO > PC
                 const projectTypeMultiplier = PROJECT_TYPE_MULTIPLIERS[(task.ProjectType || '').toUpperCase()] || 1.0;
 
-                // Dwell time multiplier: boost priority when a concurrent sibling at the same
-                // Order level has already completed and this task is still waiting
+                // Dwell time multiplier: boost priority when a task's predecessor completed
+                // but this task has been waiting too long to get picked up
                 let dwellMultiplier = 1.0;
-                const dwellOrderKey = `${task.Project}|${task.SKU}|${task.Order}`;
-                const firstSiblingCompletion = firstCompletionByOrder.get(dwellOrderKey);
-                if (firstSiblingCompletion) {
-                    const dwellDays = (current_date - firstSiblingCompletion) / (1000 * 60 * 60 * 24);
-                    if (dwellDays > maxIdleDays) {
-                        dwellMultiplier = 1 + ((dwellDays - maxIdleDays) / maxIdleDays);
-                        dwellMultiplier = Math.min(dwellMultiplier, weights.dwellCap);
+                const skuKeyForDwell = `${task.Project}|${task.SKU}`;
+                const allSkuTasksForDwell = schedulableTasksMap.get(skuKeyForDwell) || [];
+                const predecessorOrders = allSkuTasksForDwell
+                    .filter(t => t.Order < task.Order)
+                    .map(t => t.Order);
+                if (predecessorOrders.length > 0) {
+                    const maxPredOrder = Math.max(...predecessorOrders);
+                    const predKey = `${task.Project}|${task.SKU}|${maxPredOrder}`;
+                    const predCompletionDate = completionBySkuOrder.get(predKey);
+                    if (predCompletionDate) {
+                        const dwellDays = (current_date - predCompletionDate) / (1000 * 60 * 60 * 24);
+                        if (dwellDays > maxIdleDays) {
+                            dwellMultiplier = 1 + ((dwellDays - maxIdleDays) / maxIdleDays);
+                            dwellMultiplier = Math.min(dwellMultiplier, weights.dwellCap);
+                        }
                     }
                 }
 
-                task.DynamicPriority = (task.BasePriority * dueDateMultiplier * assemblyGroupMultiplier * projectTypeMultiplier * dwellMultiplier) / task.TeamCapacity;
+                // In-progress boost: tasks currently being worked on in Fulcrum get priority
+                const inProgressMultiplier = task.InProgress ? weights.inProgressBoost : 1.0;
+
+                task.DynamicPriority = (task.BasePriority * dueDateMultiplier * assemblyGroupMultiplier * projectTypeMultiplier * dwellMultiplier * inProgressMultiplier) / task.TeamCapacity;
                 task._dueDateMultiplier = dueDateMultiplier;
                 task._assemblyGroupMultiplier = assemblyGroupMultiplier;
                 task._projectTypeMultiplier = projectTypeMultiplier;
                 task._dwellMultiplier = dwellMultiplier;
+                task._inProgressMultiplier = inProgressMultiplier;
             });
 
             // Capture priority snapshots weekly (Mondays) with top 50 tasks to keep response size manageable
@@ -666,6 +693,7 @@ const runSchedulingEngine = async (
                         ProjectTypeMultiplier: Number((t._projectTypeMultiplier || 1).toFixed(2)),
                         BottleneckMultiplier: 1,
                         DwellMultiplier: Number((t._dwellMultiplier || 1).toFixed(2)),
+                        InProgressMultiplier: Number((t._inProgressMultiplier || 1).toFixed(2)),
                         TeamCapacity: t.TeamCapacity,
                         DynamicPriority: Number(t.DynamicPriority.toFixed(2)),
                         DaysUntilDue: daysUntilDue,
@@ -889,11 +917,9 @@ const runSchedulingEngine = async (
                                             if (taskInArray.HoursRemaining <= 0.01) {
                                                 completed_operations.push({ Project: task_to_assign.Project, SKU: task_to_assign.SKU, Order: task_to_assign.Order, TaskID: task_to_assign.TaskID, Operation: task_to_assign.Operation, CompletionDate: new Date(current_date) });
                                                 completedTaskIDs.add(task_to_assign.TaskID);
-                                                // Track first completion at this Order level for dwell time boosting
-                                                const dwellOrderKey = `${taskInArray.Project}|${taskInArray.SKU}|${taskInArray.Order}`;
-                                                if (!firstCompletionByOrder.has(dwellOrderKey)) {
-                                                    firstCompletionByOrder.set(dwellOrderKey, new Date(current_date));
-                                                }
+                                                // Track completion at this Order level for dwell time boosting
+                                                const compKey = `${taskInArray.Project}|${taskInArray.SKU}|${taskInArray.Order}`;
+                                                completionBySkuOrder.set(compKey, new Date(current_date));
                                                 if (taskInArray.Order === skuMaxOrderMap[taskInArray.SKU]) {
                                                     const skuKey = `${taskInArray.Project}|${taskInArray.SKU}`;
                                                     const finalSkuValue = skuValueMap[skuKey] || 0;

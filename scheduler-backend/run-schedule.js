@@ -326,7 +326,35 @@ async function main() {
                 });
                 const filtered = before - projectTasks.length;
                 if (!quiet) console.log(`  Filtered out ${filtered} completed operations (${projectTasks.length} remaining)`);
-                // Close pool after query so the process can exit
+
+                // Query for in-progress operations (Running/Paused in Fulcrum)
+                const ipResult = await pgPool.query(
+                    `WITH latest_events AS (
+                        SELECT job_name, item_reference_name, operation_name, log_type,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY job_name, item_reference_name, operation_name
+                                ORDER BY created_at DESC
+                            ) as rn
+                        FROM raw_fulcrum_job_log
+                        WHERE log_type IN ('OperationLaborStarted', 'OperationLaborStopped', 'OperationRunCompleted')
+                        AND job_name = ANY($1)
+                    )
+                    SELECT job_name, item_reference_name, operation_name
+                    FROM latest_events WHERE rn = 1
+                    AND log_type IN ('OperationLaborStarted', 'OperationLaborStopped')`,
+                    [projectNames]
+                );
+                const inProgressOps = new Set(
+                    ipResult.rows.map(r => `${r.job_name}|${r.item_reference_name}|${r.operation_name}`)
+                );
+                projectTasks.forEach(t => {
+                    const key = `${t.Project}|${t.SKU}|${t.Operation}`;
+                    t.InProgress = inProgressOps.has(key);
+                });
+                const ipCount = projectTasks.filter(t => t.InProgress).length;
+                if (!quiet) console.log(`  Tagged ${ipCount} in-progress operations (Running/Paused)`);
+
+                // Close pool after queries so the process can exit
                 await pgPool.end();
             } catch (err) {
                 console.error(`  Database warning: ${err.message}. Running without completion filtering.`);

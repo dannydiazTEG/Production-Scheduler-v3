@@ -240,6 +240,43 @@ async function prepareProjectData(projectTasks, updateProgress) {
 
     logs.push(`Filtered out ${projectTasks.length - remainingTasks.length} completed operations.`);
 
+    // Query for in-progress operations (Running or Paused in Fulcrum)
+    let inProgressOps = new Set();
+    try {
+        if (pgPool) {
+            const ipQuery = `
+                WITH latest_events AS (
+                    SELECT
+                        job_name, item_reference_name, operation_name, log_type,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY job_name, item_reference_name, operation_name
+                            ORDER BY created_at DESC
+                        ) as rn
+                    FROM raw_fulcrum_job_log
+                    WHERE log_type IN ('OperationLaborStarted', 'OperationLaborStopped', 'OperationRunCompleted')
+                    AND job_name = ANY($1)
+                )
+                SELECT job_name, item_reference_name, operation_name
+                FROM latest_events
+                WHERE rn = 1
+                AND log_type IN ('OperationLaborStarted', 'OperationLaborStopped')
+            `;
+            const ipResult = await pgPool.query(ipQuery, [projectNames]);
+            ipResult.rows.forEach(row => {
+                inProgressOps.add(`${row.job_name}|${row.item_reference_name}|${row.operation_name}`);
+            });
+            logs.push(`Found ${inProgressOps.size} in-progress operations (Running/Paused in Fulcrum).`);
+        }
+    } catch (err) {
+        logs.push(`In-progress query failed: ${err.message}. Continuing without in-progress tagging.`);
+    }
+
+    // Tag remaining tasks with in-progress status
+    remainingTasks.forEach(task => {
+        const key = `${task.Project}|${task.SKU}|${task.Operation}`;
+        task.InProgress = inProgressOps.has(key);
+    });
+
     return { tasks: remainingTasks, logs, completedTasks: completedTasksForReport };
 }
 
