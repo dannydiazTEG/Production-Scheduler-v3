@@ -6,6 +6,7 @@
 //   node run-schedule.js --tasks <csv> --config <json>
 //   node run-schedule.js --tasks <csv> --config <json> --weights '{"pastDueBase": 150}'
 //   node run-schedule.js --tasks <csv> --config <json> --out results.json
+//   node run-schedule.js --tasks <csv> --config <json> --no-db
 //
 // Inputs:
 //   --tasks   CSV file with columns: Project, Store, SKU, SKU Name, Operation,
@@ -15,8 +16,13 @@
 //   --weights Optional JSON string or file path with priority weight overrides
 //   --out     Output file path (default: prints summary to stdout)
 //   --type    Default project type when not in CSV: NSO, INFILL, RENO, PC (default: NSO)
+//   --no-db   Skip database query for completed tasks (schedule all tasks as-is)
 //   --quiet   Suppress progress messages
 // =================================================================
+
+if (process.env.NODE_ENV !== 'production') {
+    try { require('dotenv').config(); } catch { /* dotenv optional */ }
+}
 
 const fs = require('fs');
 const path = require('path');
@@ -37,6 +43,7 @@ function parseArgs() {
         else if (args[i] === '--weights' && args[i + 1]) parsed.weights = args[++i];
         else if (args[i] === '--out' && args[i + 1]) parsed.out = args[++i];
         else if (args[i] === '--type' && args[i + 1]) parsed.type = args[++i];
+        else if (args[i] === '--no-db') parsed.noDb = true;
         else if (args[i] === '--quiet') parsed.quiet = true;
         else if (args[i] === '--help' || args[i] === '-h') parsed.help = true;
     }
@@ -58,6 +65,7 @@ Options:
   --weights <json>   Priority weight overrides (JSON string or file path)
   --out <path>       Write full results to JSON file
   --type <type>      Default project type: NSO, INFILL, RENO, PC (default: NSO)
+  --no-db            Skip database lookup for completed tasks
   --quiet            Suppress progress output
   --help             Show this help
 
@@ -282,7 +290,7 @@ async function main() {
     if (!quiet) console.log('Loading inputs...');
 
     const config = JSON.parse(fs.readFileSync(args.config, 'utf-8'));
-    const projectTasks = processTasksCsv(args.tasks, defaultType);
+    let projectTasks = processTasksCsv(args.tasks, defaultType);
     const priorityWeights = loadWeights(args.weights);
 
     if (!quiet) {
@@ -292,6 +300,42 @@ async function main() {
         if (priorityWeights) {
             console.log(`  Weight overrides: ${JSON.stringify(priorityWeights)}`);
         }
+    }
+
+    // Filter out completed tasks from database (unless --no-db)
+    if (!args.noDb) {
+        const pgPool = require('./db');
+        if (pgPool) {
+            try {
+                if (!quiet) console.log('  Querying database for completed operations...');
+                const projectNames = [...new Set(projectTasks.map(t => t.Project))];
+                const result = await pgPool.query(
+                    `SELECT job_name, item_reference_name, operation_name
+                     FROM raw_fulcrum_job_log
+                     WHERE log_type = 'OperationRunCompleted'
+                     AND job_name = ANY($1)`,
+                    [projectNames]
+                );
+                const completedOps = new Set(
+                    result.rows.map(r => `${r.job_name}|${r.item_reference_name}|${r.operation_name}`)
+                );
+                const before = projectTasks.length;
+                projectTasks = projectTasks.filter(t => {
+                    const key = `${t.Project}|${t.SKU}|${t.Operation}`;
+                    return !completedOps.has(key);
+                });
+                const filtered = before - projectTasks.length;
+                if (!quiet) console.log(`  Filtered out ${filtered} completed operations (${projectTasks.length} remaining)`);
+                // Close pool after query so the process can exit
+                await pgPool.end();
+            } catch (err) {
+                console.error(`  Database warning: ${err.message}. Running without completion filtering.`);
+            }
+        } else {
+            if (!quiet) console.log('  No DATABASE_URL set — skipping completion filtering');
+        }
+    } else {
+        if (!quiet) console.log('  --no-db flag set — skipping completion filtering');
     }
 
     // Build engine inputs from config

@@ -1,6 +1,6 @@
 // server.js
 // This is the backend server for your Production Scheduling Engine.
-// It now includes logic for Snowflake integration and asynchronous job processing.
+// It now includes logic for Postgres integration and asynchronous job processing.
 // --- VERSION 3.2: Added LagAfterHours logic for process sit/dry time ---
 
 if (process.env.NODE_ENV !== 'production') {
@@ -9,9 +9,9 @@ if (process.env.NODE_ENV !== 'production') {
 
 const express = require('express');
 const cors = require('cors');
-const snowflake = require('snowflake-sdk');
 const fetch = require('node-fetch');
 const { v4: uuidv4 } = require('uuid'); // To generate unique job IDs
+const pgPool = require('./db');
 const {
     runSchedulingEngine,
     DEFAULT_PRIORITY_WEIGHTS,
@@ -184,84 +184,52 @@ async function loadMasterRoutingData() {
     }
 }
 
-// =================================================================
-// --- SNOWFLAKE CONNECTION POOL ---
-// =================================================================
-let snowflakePool;
-try {
-    snowflakePool = snowflake.createPool({
-        account: process.env.SNOWFLAKE_ACCOUNT,
-        username: process.env.SNOWFLAKE_USER,
-        password: process.env.SNOWFLAKE_PASSWORD,
-        warehouse: process.env.SNOWFLAKE_WAREHOUSE,
-        database: process.env.SNOWFLAKE_DATABASE,
-        schema: process.env.SNOWFLAKE_SCHEMA
-    }, {
-        max: 10, // max number of connections in the pool
-        min: 1   // min number of connections in the pool
-    });
-} catch (err) {
-    console.error(`WARNING: Failed to create Snowflake connection pool: ${err.message}`);
-    console.error('Server will start but Snowflake-dependent features will not work.');
-    snowflakePool = null;
-}
-
-// --- Data Preparation Logic with Snowflake ---
+// --- Data Preparation Logic (Postgres) ---
 async function prepareProjectData(projectTasks, updateProgress) {
     const logs = [];
-    const projectNumbers = [...new Set(projectTasks.map(p => p['Project']))];
+    const projectNames = [...new Set(projectTasks.map(p => p['Project']))];
 
-    if (projectNumbers.length === 0) {
+    if (projectNames.length === 0) {
         return { tasks: [], logs: ["No projects were provided to prepare."], completedTasks: [] };
     }
 
     let completedOperations = new Set();
     let completedTasksForReport = [];
-    
+
     let liveCompletedTasks = [];
     try {
-        updateProgress(5, 'Querying Snowflake for completed tasks...');
-        const placeholders = projectNumbers.map(() => '?').join(',');
+        if (!pgPool) {
+            throw new Error('DATABASE_URL not configured — no database connection available');
+        }
+        updateProgress(5, 'Querying database for completed tasks...');
         const query = `
-            SELECT JOBNAME, ITEMREFERENCE_NUMBER, JOBOPERATIONNAME, CREATEDUTC
-            FROM JOBLOG 
-            WHERE LOGTYPE = 'OperationRunCompleted'
-            AND JOBNAME IN (${placeholders});
+            SELECT job_name, item_reference_name, operation_name, created_at
+            FROM raw_fulcrum_job_log
+            WHERE log_type = 'OperationRunCompleted'
+            AND job_name = ANY($1)
         `;
 
-        await snowflakePool.use(async (connection) => {
-            const statement = await connection.execute({
-                sqlText: query,
-                binds: projectNumbers,
-            });
+        const result = await pgPool.query(query, [projectNames]);
+        liveCompletedTasks = result.rows;
 
-            liveCompletedTasks = await new Promise((resolve, reject) => {
-                const rows = [];
-                statement.streamRows()
-                    .on('error', (err) => reject(err))
-                    .on('data', (row) => rows.push(row))
-                    .on('end', () => resolve(rows));
-            });
-        });
-
-        logs.push(`Found ${liveCompletedTasks.length} completed operations in Snowflake.`);
-        updateProgress(10, 'Processing Snowflake results...');
+        logs.push(`Found ${liveCompletedTasks.length} completed operations in database.`);
+        updateProgress(10, 'Processing completed task results...');
 
     } catch (err) {
-        logs.push(`Snowflake Error: ${err.message}. Proceeding without live data.`);
-        console.error('Snowflake query failed:', err);
-        updateProgress(10, 'Snowflake query failed. Skipping check...');
-        liveCompletedTasks = []; 
+        logs.push(`Database Error: ${err.message}. Proceeding without live data.`);
+        console.error('Database query failed:', err);
+        updateProgress(10, 'Database query failed. Skipping completion check...');
+        liveCompletedTasks = [];
     }
-    
+
     liveCompletedTasks.forEach(row => {
-        const key = `${row.JOBNAME}|${row.ITEMREFERENCE_NUMBER}|${row.JOBOPERATIONNAME}`;
+        const key = `${row.job_name}|${row.item_reference_name}|${row.operation_name}`;
         completedOperations.add(key);
         completedTasksForReport.push({
-            Project: row.JOBNAME,
-            SKU: row.ITEMREFERENCE_NUMBER,
-            Operation: row.JOBOPERATIONNAME,
-            CompletionDate: formatDate(row.CREATEDUTC)
+            Project: row.job_name,
+            SKU: row.item_reference_name,
+            Operation: row.operation_name,
+            CompletionDate: formatDate(row.created_at)
         });
     });
 
@@ -270,8 +238,8 @@ async function prepareProjectData(projectTasks, updateProgress) {
         return !completedOperations.has(operationKey);
     });
 
-    logs.push(`Filtered out ${projectTasks.length - remainingTasks.length} completed operations based on Snowflake data.`);
-    
+    logs.push(`Filtered out ${projectTasks.length - remainingTasks.length} completed operations.`);
+
     return { tasks: remainingTasks, logs, completedTasks: completedTasksForReport };
 }
 
@@ -299,11 +267,11 @@ function computeCompletionTimeline(projectTasks, completedTasks, completedOperat
         projectInfo[proj].totalOps += 1;
     }
 
-    // 2. Snowflake-completed operation count per project (excluding ignored teams)
-    const snowflakeOps = {};
+    // 2. Previously-completed operation count per project (excluding ignored teams)
+    const dbCompletedOps = {};
     for (const ct of (completedTasks || [])) {
         if (isIgnored(ct.Operation)) continue;
-        snowflakeOps[ct.Project] = (snowflakeOps[ct.Project] || 0) + 1;
+        dbCompletedOps[ct.Project] = (dbCompletedOps[ct.Project] || 0) + 1;
     }
 
     // 3. Scheduled operation completions per project per date (excluding ignored teams)
@@ -324,13 +292,13 @@ function computeCompletionTimeline(projectTasks, completedTasks, completedOperat
     for (const [proj, info] of Object.entries(projectInfo)) {
         if (info.totalOps === 0) continue;
 
-        const sfOps = snowflakeOps[proj] || 0;
+        const sfOps = dbCompletedOps[proj] || 0;
         const dailyMap = dailyByProject[proj] || {};
         const dates = Object.keys(dailyMap).sort();
 
         const timeline = [];
 
-        // Starting point: Snowflake completion at schedule start
+        // Starting point: DB completion at schedule start
         const startPct = (sfOps / info.totalOps) * 100;
         timeline.push({
             date: startDate,
@@ -340,7 +308,7 @@ function computeCompletionTimeline(projectTasks, completedTasks, completedOperat
         });
         allDatesSet.add(startDate);
 
-        // Accumulate daily completions on top of the Snowflake base
+        // Accumulate daily completions on top of the DB base
         let cumulative = sfOps;
         for (const date of dates) {
             cumulative += dailyMap[date];
@@ -2599,18 +2567,16 @@ app.use((err, req, res, next) => {
 const startServer = async () => {
     await loadMasterRoutingData();
     
-    if (snowflakePool) {
-        console.log("Testing Snowflake pool connection...");
+    if (pgPool) {
+        console.log("Testing Postgres connection...");
         try {
-            await snowflakePool.use(async (connection) => {
-                await connection.execute({ sqlText: 'SELECT 1;' });
-            });
-            console.log('Successfully connected to Snowflake and tested the connection pool.');
+            await pgPool.query('SELECT 1');
+            console.log('Successfully connected to Postgres.');
         } catch (err) {
-            console.error(`WARNING: Could not establish initial connection to Snowflake via the pool. The server will still start, but queries will fail until the connection is restored. Error: ${err.message}`);
+            console.error(`WARNING: Could not connect to Postgres. The server will still start, but completion queries will fail. Error: ${err.message}`);
         }
     } else {
-        console.warn('WARNING: Snowflake pool not initialized. Snowflake-dependent features disabled.');
+        console.warn('WARNING: DATABASE_URL not set. Completion filtering disabled — all tasks will be scheduled.');
     }
 
     const server = app.listen(port, '0.0.0.0', () => {
