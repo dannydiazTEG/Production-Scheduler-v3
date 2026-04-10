@@ -20,6 +20,7 @@ const {
     getWeekStartDate,
     TEAM_SORT_ORDER,
 } = require('./scheduling-engine');
+const { prepareProjectData } = require('./data-prep');
 
 // --- Setup ---
 const app = express();
@@ -185,99 +186,10 @@ async function loadMasterRoutingData() {
 }
 
 // --- Data Preparation Logic (Postgres) ---
-async function prepareProjectData(projectTasks, updateProgress) {
-    const logs = [];
-    const projectNames = [...new Set(projectTasks.map(p => p['Project']))];
-
-    if (projectNames.length === 0) {
-        return { tasks: [], logs: ["No projects were provided to prepare."], completedTasks: [] };
-    }
-
-    let completedOperations = new Set();
-    let completedTasksForReport = [];
-
-    let liveCompletedTasks = [];
-    try {
-        if (!pgPool) {
-            throw new Error('DATABASE_URL not configured — no database connection available');
-        }
-        updateProgress(5, 'Querying database for completed tasks...');
-        const query = `
-            SELECT job_name, item_reference_name, operation_name, created_at
-            FROM raw_fulcrum_job_log
-            WHERE log_type = 'OperationRunCompleted'
-            AND job_name = ANY($1)
-        `;
-
-        const result = await pgPool.query(query, [projectNames]);
-        liveCompletedTasks = result.rows;
-
-        logs.push(`Found ${liveCompletedTasks.length} completed operations in database.`);
-        updateProgress(10, 'Processing completed task results...');
-
-    } catch (err) {
-        logs.push(`Database Error: ${err.message}. Proceeding without live data.`);
-        console.error('Database query failed:', err);
-        updateProgress(10, 'Database query failed. Skipping completion check...');
-        liveCompletedTasks = [];
-    }
-
-    liveCompletedTasks.forEach(row => {
-        const key = `${row.job_name}|${row.item_reference_name}|${row.operation_name}`;
-        completedOperations.add(key);
-        completedTasksForReport.push({
-            Project: row.job_name,
-            SKU: row.item_reference_name,
-            Operation: row.operation_name,
-            CompletionDate: formatDate(row.created_at)
-        });
-    });
-
-    const remainingTasks = projectTasks.filter(task => {
-        const operationKey = `${task.Project}|${task.SKU}|${task.Operation}`;
-        return !completedOperations.has(operationKey);
-    });
-
-    logs.push(`Filtered out ${projectTasks.length - remainingTasks.length} completed operations.`);
-
-    // Query for in-progress operations (Running or Paused in Fulcrum)
-    let inProgressOps = new Set();
-    try {
-        if (pgPool) {
-            const ipQuery = `
-                WITH latest_events AS (
-                    SELECT
-                        job_name, item_reference_name, operation_name, log_type,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY job_name, item_reference_name, operation_name
-                            ORDER BY created_at DESC
-                        ) as rn
-                    FROM raw_fulcrum_job_log
-                    WHERE log_type IN ('OperationLaborStarted', 'OperationLaborStopped', 'OperationRunCompleted')
-                    AND job_name = ANY($1)
-                )
-                SELECT job_name, item_reference_name, operation_name
-                FROM latest_events
-                WHERE rn = 1
-                AND log_type IN ('OperationLaborStarted', 'OperationLaborStopped')
-            `;
-            const ipResult = await pgPool.query(ipQuery, [projectNames]);
-            ipResult.rows.forEach(row => {
-                inProgressOps.add(`${row.job_name}|${row.item_reference_name}|${row.operation_name}`);
-            });
-            logs.push(`Found ${inProgressOps.size} in-progress operations (Running/Paused in Fulcrum).`);
-        }
-    } catch (err) {
-        logs.push(`In-progress query failed: ${err.message}. Continuing without in-progress tagging.`);
-    }
-
-    // Tag remaining tasks with in-progress status
-    remainingTasks.forEach(task => {
-        const key = `${task.Project}|${task.SKU}|${task.Operation}`;
-        task.InProgress = inProgressOps.has(key);
-    });
-
-    return { tasks: remainingTasks, logs, completedTasks: completedTasksForReport };
+// prepareProjectData is imported from data-prep.js
+// Wrapper to inject pgPool for backward compatibility with existing call sites
+async function prepareProjectDataLocal(projectTasks, updateProgress) {
+    return prepareProjectData(projectTasks, updateProgress, pgPool);
 }
 
 
@@ -436,8 +348,8 @@ const optimizeResources = async (
         );
 
         // Run scheduler with current resource configuration
-        const { tasks: preparedTasks } = await prepareProjectData(projectTasks, () => {});
-        
+        const { tasks: preparedTasks } = await prepareProjectDataLocal(projectTasks, () => {});
+
         const results = await runSchedulingEngine(
             preparedTasks, params, currentTeamDefs, ptoEntries, teamMemberChanges,
             workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
@@ -1829,7 +1741,7 @@ async function runMultiScenarioAnalysis(
 
     let baselineBottlenecks = null;
     let baselineResult = null;
-    const { tasks: preparedTasks } = await prepareProjectData(projectTasks, () => {});
+    const { tasks: preparedTasks } = await prepareProjectDataLocal(projectTasks, () => {});
     console.log(`Prepared ${preparedTasks.length} tasks for baseline analysis`);
 
     try {
@@ -2509,7 +2421,7 @@ app.post('/api/schedule', async (req, res) => {
             jobs[jobId].status = 'running';
             updateProgress(0, 'Preparing project data...', 'preparing');
             
-            const { tasks: preparedTasks, logs: prepLogs, completedTasks } = await prepareProjectData(projectTasks, updateProgress);
+            const { tasks: preparedTasks, logs: prepLogs, completedTasks } = await prepareProjectDataLocal(projectTasks, updateProgress);
 
             if (preparedTasks.length === 0) {
                 const combinedLogs = [...prepLogs, "All tasks for the submitted projects are already complete."];
@@ -2579,11 +2491,341 @@ app.get('/api/schedule/status/:jobId', (req, res) => {
     // After sending: if job is terminal and has a result, strip the heavy payload.
     // Express res.json() serializes synchronously, so the client gets the full data.
     // The client only needs the result once (clears polling interval on 'complete').
-    if ((job.status === 'complete' || job.status === 'error') && job.result) {
+    // Skip stripping for optimize-run jobs — results are already trimmed and the agent
+    // may poll multiple times. They'll be cleaned up by the normal job cleanup timer.
+    if ((job.status === 'complete' || job.status === 'error') && job.result && job.type !== 'optimize-run') {
         const resultKeys = Object.keys(job.result);
         console.log(`[Job ${jobId}] Result delivered to client (keys: ${resultKeys.join(', ')}). Releasing from memory.`);
         job.result = null;
         job.resultDeliveredAt = Date.now();
+    }
+});
+
+// --- Agent Optimization Endpoints ---
+const { scoreResult, parseDatesCsv, extractProjectTypeMap, trimEngineResult } = require('./scoring');
+const { sendOptimizationReport } = require('./email-report');
+
+/**
+ * POST /api/optimize-run
+ * Run a single schedule with the given config, score it, return the score.
+ * Designed to be called as a tool by a managed Claude agent.
+ */
+app.post('/api/optimize-run', async (req, res) => {
+    console.log('Received request to /api/optimize-run');
+
+    const heapUsedMB = process.memoryUsage().heapUsed / 1024 / 1024;
+    if (heapUsedMB > MEMORY_THRESHOLD_MB) {
+        return res.status(503).json({ error: `Memory circuit breaker: ${heapUsedMB.toFixed(0)}MB heap used.` });
+    }
+    const activeJobCount = Object.values(jobs).filter(j => j.status === 'running' || j.status === 'pending').length;
+    if (activeJobCount >= MAX_JOBS) {
+        return res.status(503).json({ error: 'Too many jobs running. Please wait and try again.' });
+    }
+
+    const jobId = uuidv4();
+    jobs[jobId] = {
+        type: 'optimize-run',
+        status: 'pending',
+        progress: 0,
+        message: 'Optimization run queued...',
+        step: 'starting',
+        result: null,
+        error: null,
+        createdAt: Date.now(),
+    };
+
+    const {
+        projectTasks, params, teamDefs, ptoEntries, teamMemberChanges,
+        workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
+        startDateOverrides, endDateOverrides,
+        priorityWeights, storeDueDatesCsv, skipDbFilter
+    } = req.body;
+
+    if (!projectTasks || !params || !teamDefs) {
+        jobs[jobId].status = 'error';
+        jobs[jobId].error = 'Missing required data: projectTasks, params, and teamDefs are required.';
+        return res.status(400).json({ error: jobs[jobId].error });
+    }
+    if (!storeDueDatesCsv) {
+        jobs[jobId].status = 'error';
+        jobs[jobId].error = 'Missing storeDueDatesCsv — required for scoring.';
+        return res.status(400).json({ error: jobs[jobId].error });
+    }
+
+    res.status(202).json({ jobId });
+
+    (async () => {
+        try {
+            const updateProgress = (progress, message, step) => {
+                if (jobs[jobId]) {
+                    jobs[jobId].progress = progress;
+                    jobs[jobId].message = message;
+                    if (step) jobs[jobId].step = step;
+                }
+            };
+
+            jobs[jobId].status = 'running';
+
+            // Prepare tasks (DB filter for completed ops, unless skipped)
+            let preparedTasks;
+            if (skipDbFilter) {
+                preparedTasks = projectTasks;
+                updateProgress(10, 'Using pre-prepared tasks (DB filter skipped)...', 'preparing');
+            } else {
+                updateProgress(0, 'Preparing project data...', 'preparing');
+                const { tasks } = await prepareProjectDataLocal(projectTasks, updateProgress);
+                preparedTasks = tasks;
+            }
+
+            if (preparedTasks.length === 0) {
+                jobs[jobId].status = 'complete';
+                jobs[jobId].progress = 100;
+                jobs[jobId].message = 'All tasks already completed.';
+                jobs[jobId].step = 'done';
+                jobs[jobId].result = {
+                    score: { score: 0, feasible: true, totalLateness: 0, nsoViolations: [], overtimeHours: 0, utilizationStdDev: 0, dwellDays: 0, storeBreakdown: [] },
+                    projectSummary: [],
+                    teamUtilization: [],
+                    weeklyOutput: [],
+                    projectedCompletion: null,
+                    configUsed: { params, priorityWeights: priorityWeights || {}, headcounts: teamDefs.headcounts }
+                };
+                return;
+            }
+
+            updateProgress(15, 'Running scheduling engine...', 'simulating');
+
+            const engineResult = await runSchedulingEngine(
+                preparedTasks, params, teamDefs,
+                ptoEntries || [], teamMemberChanges || [],
+                workHourOverrides || [], hybridWorkers || [],
+                efficiencyData || {}, teamMemberNameMap || {},
+                startDateOverrides || {}, endDateOverrides || {},
+                updateProgress,
+                priorityWeights || undefined
+            );
+
+            if (engineResult.error) {
+                jobs[jobId].status = 'complete';
+                jobs[jobId].progress = 100;
+                jobs[jobId].message = 'Engine returned an error.';
+                jobs[jobId].step = 'done';
+
+                const storeDueDates = parseDatesCsv(storeDueDatesCsv);
+                jobs[jobId].result = {
+                    score: { score: Infinity, feasible: false, totalLateness: Infinity, nsoViolations: [{ store: 'ENGINE_ERROR', reason: engineResult.error }], overtimeHours: 0, utilizationStdDev: 0, dwellDays: 0, storeBreakdown: [] },
+                    projectSummary: [],
+                    teamUtilization: [],
+                    weeklyOutput: [],
+                    projectedCompletion: null,
+                    configUsed: { params, priorityWeights: priorityWeights || {}, headcounts: teamDefs.headcounts },
+                    engineError: engineResult.error,
+                    logs: (engineResult.logs || []).slice(-30)
+                };
+                return;
+            }
+
+            // Score the result
+            updateProgress(90, 'Scoring result...', 'scoring');
+            const storeDueDates = parseDatesCsv(storeDueDatesCsv);
+            const scoreData = scoreResult(engineResult, storeDueDates, parseFloat(params.hoursPerDay) || 8);
+            const projectTypeMap = extractProjectTypeMap(engineResult.finalSchedule || []);
+            const trimmed = trimEngineResult(engineResult);
+
+            jobs[jobId].status = 'complete';
+            jobs[jobId].progress = 100;
+            jobs[jobId].message = `Score: ${scoreData.score} | Feasible: ${scoreData.feasible} | Lateness: ${scoreData.totalLateness}d`;
+            jobs[jobId].step = 'done';
+            jobs[jobId].result = {
+                score: scoreData,
+                projectSummary: trimmed.projectSummary,
+                teamUtilization: trimmed.teamUtilization,
+                weeklyOutput: trimmed.weeklyOutput,
+                projectedCompletion: trimmed.projectedCompletion,
+                projectTypeMap,
+                configUsed: {
+                    params,
+                    priorityWeights: priorityWeights || {},
+                    headcounts: teamDefs.headcounts,
+                    workHourOverrides: workHourOverrides || [],
+                    teamMemberChanges: teamMemberChanges || [],
+                    hybridWorkers: hybridWorkers || []
+                },
+                logs: (trimmed.logs || []).slice(-30)
+            };
+
+            console.log(`[Job ${jobId}] Optimize-run complete. Score: ${scoreData.score}, Feasible: ${scoreData.feasible}`);
+
+        } catch (e) {
+            console.error(`[Job ${jobId}] optimize-run failed:`, e);
+            jobs[jobId].status = 'error';
+            jobs[jobId].error = `Optimization run failed: ${e.message}`;
+            jobs[jobId].result = { details: e.message };
+        }
+    })();
+});
+
+/**
+ * POST /api/optimization-data
+ * Upload task CSV, dates CSV, and config JSON for the agent to use.
+ * Stores in Postgres optimization_inputs table.
+ */
+app.post('/api/optimization-data', async (req, res) => {
+    const { tasksCsv, datesCsv, configJson } = req.body;
+
+    if (!tasksCsv || !datesCsv || !configJson) {
+        return res.status(400).json({ error: 'Missing required fields: tasksCsv, datesCsv, configJson' });
+    }
+
+    try {
+        if (!pgPool) {
+            return res.status(503).json({ error: 'Database not configured.' });
+        }
+
+        // Create table if not exists
+        await pgPool.query(`
+            CREATE TABLE IF NOT EXISTS optimization_inputs (
+                id SERIAL PRIMARY KEY,
+                tasks_csv TEXT NOT NULL,
+                dates_csv TEXT NOT NULL,
+                config_json JSONB NOT NULL,
+                uploaded_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        `);
+
+        // Insert new row
+        await pgPool.query(
+            'INSERT INTO optimization_inputs (tasks_csv, dates_csv, config_json) VALUES ($1, $2, $3)',
+            [tasksCsv, datesCsv, JSON.stringify(configJson)]
+        );
+
+        // Keep only latest 5 rows
+        await pgPool.query(`
+            DELETE FROM optimization_inputs
+            WHERE id NOT IN (
+                SELECT id FROM optimization_inputs ORDER BY uploaded_at DESC LIMIT 5
+            )
+        `);
+
+        res.json({ success: true, message: 'Optimization data uploaded.' });
+    } catch (e) {
+        console.error('Failed to store optimization data:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * GET /api/optimization-data/latest
+ * Fetch the most recent optimization data upload.
+ * Returns parsed tasks, dates CSV text, and config ready for /api/optimize-run.
+ */
+app.get('/api/optimization-data/latest', async (req, res) => {
+    try {
+        if (!pgPool) {
+            return res.status(503).json({ error: 'Database not configured.' });
+        }
+
+        const result = await pgPool.query(
+            'SELECT tasks_csv, dates_csv, config_json, uploaded_at FROM optimization_inputs ORDER BY uploaded_at DESC LIMIT 1'
+        );
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'No optimization data uploaded yet.' });
+        }
+
+        const row = result.rows[0];
+        const config = typeof row.config_json === 'string' ? JSON.parse(row.config_json) : row.config_json;
+
+        // Parse the tasks CSV into an array of task objects
+        const parsedTasks = parseTasksCsv(row.tasks_csv, config);
+
+        res.json({
+            projectTasks: parsedTasks,
+            params: config.params || {},
+            teamDefs: config.teamDefs || {},
+            ptoEntries: config.ptoEntries || [],
+            teamMemberChanges: config.teamMemberChanges || [],
+            workHourOverrides: config.workHourOverrides || [],
+            hybridWorkers: config.hybridWorkers || [],
+            efficiencyData: config.efficiencyData || {},
+            teamMemberNameMap: config.teamMemberNameMap || {},
+            startDateOverrides: config.startDateOverrides || {},
+            endDateOverrides: config.endDateOverrides || {},
+            storeDueDatesCsv: row.dates_csv,
+            uploadedAt: row.uploaded_at
+        });
+    } catch (e) {
+        console.error('Failed to fetch optimization data:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * Parse a tasks CSV string into an array of task objects.
+ * Mirrors the CSV parsing logic from run-schedule.js.
+ */
+function parseTasksCsv(csvText, config) {
+    const lines = csvText.trim().split('\n');
+    if (lines.length < 2) return [];
+
+    const headers = lines[0].split(',').map(h => h.trim());
+
+    // Column aliases (same as run-schedule.js)
+    const aliases = {
+        'Game': 'Project', 'Expected Hours': 'Estimated Hours',
+        'Item Name': 'SKU Name', 'Step': 'Operation', 'Step Order': 'Order'
+    };
+    const normalizedHeaders = headers.map(h => aliases[h] || h);
+
+    const tasks = [];
+    for (let i = 1; i < lines.length; i++) {
+        const cols = lines[i].split(',').map(c => c.trim());
+        if (cols.length < normalizedHeaders.length - 2) continue; // Skip malformed rows
+
+        const row = {};
+        normalizedHeaders.forEach((h, idx) => { row[h] = cols[idx] || ''; });
+
+        // Normalize fields
+        row['Estimated Hours'] = parseFloat(row['Estimated Hours']) || 0;
+        row['Value'] = parseFloat(row['Value']) || 0;
+        row['Order'] = parseInt(row['Order']) || 0;
+        row['LagAfterHours'] = parseFloat(row['LagAfterHours']) || 0;
+        row['AssemblyGroup'] = row['AssemblyGroup'] || '';
+        row['DelayUntilClose'] = row['DelayUntilClose'] === 'true' || row['DelayUntilClose'] === 'TRUE';
+        row['ProjectType'] = (row['ProjectType'] || 'NSO').toUpperCase();
+
+        if (!row['Project'] || !row['SKU'] || !row['Operation']) continue; // Skip empty rows
+        tasks.push(row);
+    }
+
+    return tasks;
+}
+
+/**
+ * POST /api/send-optimization-report
+ * Send the optimization report email. Called by the agent when optimization is complete.
+ */
+app.post('/api/send-optimization-report', async (req, res) => {
+    const { baselineScore, bestScore, bestConfig, runHistory, strategistNotes, totalIterations, durationMinutes, recipients } = req.body;
+
+    if (!baselineScore || !bestScore) {
+        return res.status(400).json({ error: 'Missing required fields: baselineScore and bestScore.' });
+    }
+
+    const emailRecipients = recipients || {
+        detailed: ['danny.diaz@theescapegame.com'],
+        summary: ['dan@theescapegame.com']
+    };
+
+    try {
+        const results = await sendOptimizationReport(
+            { baselineScore, bestScore, bestConfig, runHistory, strategistNotes, totalIterations, durationMinutes },
+            emailRecipients
+        );
+        res.json({ success: true, message: `Report sent to ${results.length} recipient group(s).`, results });
+    } catch (e) {
+        console.error('Failed to send optimization report:', e);
+        res.status(500).json({ error: `Email delivery failed: ${e.message}` });
     }
 });
 
