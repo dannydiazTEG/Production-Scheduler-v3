@@ -1,10 +1,16 @@
 /**
  * scoring.js — Evaluates scheduling engine results against store-level due dates.
  *
- * Hard gate: All NSO stores must hit their production due dates.
+ * NSO gate: NSO stores get a sliding tolerance based on distance from today.
+ *   - 0-1 months out: 0 days tolerance
+ *   - 2-3 months out: 3 days
+ *   - 4-6 months out: 5 days
+ *   - 7+ months out: up to 10 days (capped)
  * Primary metric: Total lateness across all store types.
- * Secondary: Overtime hours, utilization evenness, dwell time.
+ * Secondary: Overtime hours, dwell time.
  */
+
+const MAX_NSO_TOLERANCE_DAYS = 10;
 
 // --- Levenshtein distance for fuzzy store name matching ---
 function levenshtein(a, b) {
@@ -52,10 +58,132 @@ function matchStoreName(storeName, storeDueDates) {
 }
 
 // --- Calendar day diff ---
+// Handles mixed date formats (YYYY-MM-DD and M/D/YYYY) by parsing to local date parts.
+function parseLocalDate(str) {
+    if (!str) return new Date(NaN);
+    const s = String(str).trim();
+    // ISO format: YYYY-MM-DD — parse as local, not UTC
+    const isoMatch = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (isoMatch) return new Date(+isoMatch[1], +isoMatch[2] - 1, +isoMatch[3]);
+    // M/D/YYYY format
+    const usMatch = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+    if (usMatch) return new Date(+usMatch[3], +usMatch[1] - 1, +usMatch[2]);
+    // Fallback
+    return new Date(s);
+}
+
 function calendarDays(dateA, dateB) {
-    const a = new Date(dateA); a.setHours(0, 0, 0, 0);
-    const b = new Date(dateB); b.setHours(0, 0, 0, 0);
+    const a = parseLocalDate(dateA);
+    const b = parseLocalDate(dateB);
     return Math.round((a - b) / (24 * 60 * 60 * 1000));
+}
+
+/**
+ * Calculate NSO tolerance based on how far the due date is from today.
+ * Further out = more tolerance, capped at MAX_NSO_TOLERANCE_DAYS.
+ *
+ * @param {string} dueDate - Due date string (YYYY-MM-DD or M/D/YYYY)
+ * @param {Date} [today] - Override for testing
+ * @returns {{ toleranceDays: number, monthsOut: number }}
+ */
+function getNsoTolerance(dueDate, today) {
+    const now = today ? new Date(today.getTime()) : new Date();
+    now.setHours(0, 0, 0, 0);
+    const due = parseLocalDate(dueDate);
+
+    const monthsOut = Math.max(0, (due.getFullYear() - now.getFullYear()) * 12 + (due.getMonth() - now.getMonth()));
+
+    let toleranceDays;
+    if (monthsOut <= 1) {
+        toleranceDays = 0;
+    } else if (monthsOut <= 3) {
+        toleranceDays = 3;
+    } else if (monthsOut <= 6) {
+        toleranceDays = 5;
+    } else {
+        // 7+ months: scale up to cap. ~1.4 days per month beyond 6, capped at MAX.
+        toleranceDays = Math.min(MAX_NSO_TOLERANCE_DAYS, 5 + Math.floor((monthsOut - 6) * 1.5));
+    }
+
+    return { toleranceDays, monthsOut };
+}
+
+/**
+ * Compute a human-readable grade from a score result.
+ * Returns a letter grade (A+ through F) and a one-line summary.
+ */
+function computeGrade(scoreData) {
+    const { feasible, totalLateness, nsoViolations, overtimeHours, nsoWithinTolerance } = scoreData;
+
+    // Hard fail: NSO violations beyond tolerance
+    if (!feasible) {
+        if (nsoViolations.length >= 3) return { grade: 'F', summary: `${nsoViolations.length} NSO stores exceed tolerance` };
+        if (totalLateness > 20) return { grade: 'D', summary: `NSO violations + ${totalLateness} total days late` };
+        return { grade: 'D+', summary: `${nsoViolations.length} NSO store(s) exceed tolerance` };
+    }
+
+    // Feasible — grade based on overall lateness
+    if (totalLateness === 0) {
+        if (overtimeHours === 0) return { grade: 'A+', summary: 'All stores on time, no overtime' };
+        return { grade: 'A', summary: 'All stores on time' };
+    }
+    if (totalLateness <= 5) {
+        const withinNote = (nsoWithinTolerance || 0) > 0 ? `, ${nsoWithinTolerance} NSO within tolerance` : '';
+        return { grade: 'A-', summary: `${totalLateness}d total lateness${withinNote}` };
+    }
+    if (totalLateness <= 15) {
+        return { grade: 'B+', summary: `${totalLateness}d total lateness across non-critical stores` };
+    }
+    if (totalLateness <= 30) {
+        return { grade: 'B', summary: `${totalLateness}d total lateness` };
+    }
+    if (totalLateness <= 50) {
+        return { grade: 'B-', summary: `${totalLateness}d total lateness — room for improvement` };
+    }
+    return { grade: 'C', summary: `${totalLateness}d total lateness — significant delays` };
+}
+
+/**
+ * Extract utilization valleys and workload ratio peaks from engine results.
+ * Excludes Receiving, QC, and Hybrid teams.
+ *
+ * @param {Array} teamUtilization - [{ week, teams: [{ name, worked, capacity, utilization }] }]
+ * @param {Array} teamWorkload - [{ week, teams: [{ name, workloadRatio }] }]
+ * @returns {{ valleys: Array, peaks: Array }}
+ */
+function analyzeTeamHealth(teamUtilization, teamWorkload) {
+    const EXCLUDED_TEAMS = new Set(['Receiving', 'QC', 'Hybrid']);
+    const VALLEY_THRESHOLD = 40;  // Utilization below 40% = valley
+    const PEAK_THRESHOLD = 150;   // Workload ratio above 150% = overloaded
+
+    // Find utilization valleys
+    const valleys = [];
+    for (const weekData of (teamUtilization || [])) {
+        for (const team of weekData.teams) {
+            if (EXCLUDED_TEAMS.has(team.name)) continue;
+            const util = team.utilization || 0;
+            if (util > 0 && util < VALLEY_THRESHOLD) {
+                valleys.push({ week: weekData.week, team: team.name, utilization: util });
+            }
+        }
+    }
+
+    // Find workload ratio peaks
+    const peaks = [];
+    for (const weekData of (teamWorkload || [])) {
+        for (const team of weekData.teams) {
+            if (EXCLUDED_TEAMS.has(team.name)) continue;
+            if (team.workloadRatio > PEAK_THRESHOLD) {
+                peaks.push({ week: weekData.week, team: team.name, workloadRatio: Math.round(team.workloadRatio) });
+            }
+        }
+    }
+
+    // Sort peaks by severity (highest ratio first), valleys by lowest util
+    peaks.sort((a, b) => b.workloadRatio - a.workloadRatio);
+    valleys.sort((a, b) => a.utilization - b.utilization);
+
+    return { valleys, peaks };
 }
 
 /**
@@ -97,8 +225,8 @@ function parseDatesCsv(csvText) {
  * @param {number} standardHoursPerDay - Default 8
  * @returns {Object} Score breakdown
  */
-function scoreResult(engineResult, storeDueDates, standardHoursPerDay = 8) {
-    const { finalSchedule, projectSummary, teamUtilization, weeklyOutput } = engineResult;
+function scoreResult(engineResult, storeDueDates, standardHoursPerDay = 8, today) {
+    const { finalSchedule, projectSummary, teamUtilization, weeklyOutput, teamWorkload } = engineResult;
 
     if (engineResult.error) {
         return {
@@ -139,14 +267,15 @@ function scoreResult(engineResult, storeDueDates, standardHoursPerDay = 8) {
     }
 
     // --- Score each store ---
-    const nsoViolations = [];
+    const nsoViolations = [];  // Stores that exceed tolerance
+    const nsoWarnings = [];    // NSO stores late but within tolerance
     const storeBreakdown = [];
     let totalLateness = 0;
+    let nsoWithinTolerance = 0;
 
     for (const [store, data] of storeFinishMap.entries()) {
         const match = matchStoreName(store, storeDueDates);
         if (!match) {
-            // Store not in Dates CSV — skip scoring (can't evaluate)
             storeBreakdown.push({
                 store,
                 projectTypes: Array.from(data.projectTypes),
@@ -158,13 +287,38 @@ function scoreResult(engineResult, storeDueDates, standardHoursPerDay = 8) {
             continue;
         }
 
-        const dueDateEntry = match.dueDate; // { dueDate: 'YYYY-MM-DD', projectType: 'NSO' }
+        const dueDateEntry = match.dueDate;
         const dueDate = typeof dueDateEntry === 'object' ? dueDateEntry.dueDate : dueDateEntry;
         const datesCsvType = (typeof dueDateEntry === 'object' ? dueDateEntry.projectType : '') || '';
         const isNso = data.projectTypes.has('NSO') || datesCsvType === 'NSO';
 
         const latenessDays = Math.max(0, calendarDays(data.maxFinishDate, dueDate));
         totalLateness += latenessDays;
+
+        // NSO tolerance: sliding scale based on distance, capped at 10 days
+        let toleranceDays = 0;
+        let monthsOut = 0;
+        let nsoStatus = null;
+        if (isNso) {
+            const tol = getNsoTolerance(dueDate, today);
+            toleranceDays = tol.toleranceDays;
+            monthsOut = tol.monthsOut;
+
+            if (latenessDays > 0 && latenessDays <= toleranceDays) {
+                nsoStatus = 'WITHIN_TOLERANCE';
+                nsoWithinTolerance++;
+                nsoWarnings.push({
+                    store, dueDate, finishDate: data.maxFinishDate,
+                    latenessDays, toleranceDays, monthsOut,
+                });
+            } else if (latenessDays > toleranceDays && latenessDays > 0) {
+                nsoStatus = 'EXCEEDS_TOLERANCE';
+                nsoViolations.push({
+                    store, dueDate, finishDate: data.maxFinishDate,
+                    latenessDays, toleranceDays, monthsOut,
+                });
+            }
+        }
 
         const status = latenessDays > 0 ? 'LATE' : 'ON_TIME';
         storeBreakdown.push({
@@ -175,17 +329,11 @@ function scoreResult(engineResult, storeDueDates, standardHoursPerDay = 8) {
             dueDate,
             latenessDays,
             isNso,
+            toleranceDays: isNso ? toleranceDays : undefined,
+            monthsOut: isNso ? monthsOut : undefined,
+            nsoStatus,
             status,
         });
-
-        if (isNso && latenessDays > 0) {
-            nsoViolations.push({
-                store,
-                dueDate,
-                finishDate: data.maxFinishDate,
-                latenessDays,
-            });
-        }
     }
 
     const feasible = nsoViolations.length === 0;
@@ -258,18 +406,38 @@ function scoreResult(engineResult, storeDueDates, standardHoursPerDay = 8) {
     }
 
     // --- Composite score (lower = better) ---
-    const score = (totalLateness * 1000) + (overtimeHours * 1.0) + (utilizationStdDev * 10) + (totalDwellDays * 0.5);
+    // Used internally by optimizer. Not shown directly in reports.
+    const score = (totalLateness * 1000) + (overtimeHours * 1.0) + (totalDwellDays * 0.5);
 
-    return {
+    // --- Team health analysis ---
+    const teamHealth = analyzeTeamHealth(teamUtilization, teamWorkload);
+
+    // --- Build result ---
+    const result = {
         score: Number(score.toFixed(2)),
         feasible,
         totalLateness,
         nsoViolations,
+        nsoWarnings,
+        nsoWithinTolerance,
+        nsoToleranceNote: `NSO tolerance: sliding scale up to ${MAX_NSO_TOLERANCE_DAYS} days based on distance from today. Stores further out get more tolerance.`,
         overtimeHours: Number(overtimeHours.toFixed(1)),
-        utilizationStdDev: Number(utilizationStdDev.toFixed(4)),
         dwellDays: Number(totalDwellDays.toFixed(0)),
         storeBreakdown: storeBreakdown.sort((a, b) => (b.latenessDays || 0) - (a.latenessDays || 0)),
+        teamHealth,
     };
+
+    // --- Human-readable grade ---
+    const gradeData = computeGrade(result);
+    result.grade = gradeData.grade;
+    result.gradeSummary = gradeData.summary;
+
+    // --- Report-friendly metrics ---
+    const totalStores = storeBreakdown.filter(s => s.status !== 'NO_DUE_DATE').length;
+    const onTimeStores = storeBreakdown.filter(s => s.status === 'ON_TIME').length;
+    result.onTimeRate = totalStores > 0 ? `${onTimeStores}/${totalStores} (${Math.round(onTimeStores / totalStores * 100)}%)` : 'N/A';
+
+    return result;
 }
 
 /**
@@ -294,10 +462,11 @@ function trimEngineResult(engineResult) {
     return {
         projectSummary: engineResult.projectSummary,
         teamUtilization: engineResult.teamUtilization,
+        teamWorkload: engineResult.teamWorkload,
         weeklyOutput: engineResult.weeklyOutput,
         recommendations: engineResult.recommendations,
         projectedCompletion: engineResult.projectedCompletion,
-        logs: (engineResult.logs || []).slice(-50), // Keep last 50 log lines
+        logs: (engineResult.logs || []).slice(-50),
         error: engineResult.error,
     };
 }
@@ -309,4 +478,8 @@ module.exports = {
     trimEngineResult,
     matchStoreName,
     calendarDays,
+    getNsoTolerance,
+    analyzeTeamHealth,
+    computeGrade,
+    MAX_NSO_TOLERANCE_DAYS,
 };
