@@ -10,3 +10,15 @@ services:
     # Increase timeout to 5 minutes for long-running schedules
     healthCheckPath: /
     # Set higher limits for memory and CPU
+
+  - type: cron
+    name: schedule-optimizer
+    env: node
+    buildCommand: cd scheduler-backend && npm install
+    startCommand: cd scheduler-backend && node optimizer-cron.js --iterations 25
+    schedule: "0 1 * * 1-5"
+    envVars:
+      - key: SERVER_URL
+        value: https://production-scheduler-backend-aepw.onrender.com
+      - key: NODE_ENV
+        value: production
