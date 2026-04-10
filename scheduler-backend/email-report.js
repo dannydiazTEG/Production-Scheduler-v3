@@ -23,9 +23,11 @@ function createTransporter() {
  * Generate the executive summary HTML section.
  */
 function renderExecutiveSummary(baseline, best, totalIterations, durationMinutes) {
-    const improvement = baseline.score === Infinity || baseline.score === 0
+    const baseScore = baseline.compositeScore || baseline.score || 0;
+    const bestScoreVal = best.compositeScore || best.score || 0;
+    const improvement = baseScore === 0
         ? 'N/A'
-        : `${((1 - best.score / baseline.score) * 100).toFixed(1)}%`;
+        : `${baseScore.toFixed(1)} → ${bestScoreVal.toFixed(1)} / 100`;
 
     // Grade badge color
     const gradeColors = { 'A+': '#16a34a', 'A': '#16a34a', 'A-': '#22c55e', 'B+': '#3b82f6', 'B': '#3b82f6', 'B-': '#60a5fa', 'C': '#f59e0b', 'D+': '#f97316', 'D': '#ef4444', 'F': '#dc2626' };
@@ -55,21 +57,34 @@ function renderExecutiveSummary(baseline, best, totalIterations, durationMinutes
         </div>
         <table style="width: 100%; border-collapse: collapse;">
             <tr>
+                <td style="padding: 8px 16px 8px 0; color: #64748b;">Composite Score</td>
+                <td style="padding: 8px 0; font-weight: bold;">${improvement}</td>
+            </tr>
+            <tr>
                 <td style="padding: 8px 16px 8px 0; color: #64748b;">On-Time Delivery</td>
                 <td style="padding: 8px 0; font-weight: bold;">${best.onTimeRate || 'N/A'}</td>
             </tr>
             <tr>
-                <td style="padding: 8px 16px 8px 0; color: #64748b;">NSO Status</td>
+                <td style="padding: 8px 16px 8px 0; color: #64748b;">NSO/Infill Status</td>
                 <td style="padding: 8px 0;">${nsoLine}</td>
             </tr>
+            ${best.categories ? `
             <tr>
-                <td style="padding: 8px 16px 8px 0; color: #64748b;">Total Lateness</td>
-                <td style="padding: 8px 0;">${baseline.totalLateness}d &rarr; <strong>${best.totalLateness}d</strong></td>
+                <td style="padding: 8px 16px 8px 0; color: #64748b;">NSO/Infill Buffer</td>
+                <td style="padding: 8px 0;">${best.categories.buffer}/${best.categories.bufferMax} pts</td>
             </tr>
             <tr>
-                <td style="padding: 8px 16px 8px 0; color: #64748b;">Overtime</td>
-                <td style="padding: 8px 0;">${best.overtimeHours}h</td>
+                <td style="padding: 8px 16px 8px 0; color: #64748b;">Labor Efficiency</td>
+                <td style="padding: 8px 0;">${best.categories.laborEfficiency}/${best.categories.laborEfficiencyMax} pts${best.labor ? ` ($${best.labor.efficiencyPerHour}/hr vs $${best.labor.efficiencyBaseline} target)` : ''}</td>
             </tr>
+            <tr>
+                <td style="padding: 8px 16px 8px 0; color: #64748b;">Labor Cost (OT)</td>
+                <td style="padding: 8px 0;">${best.categories.laborCost}/${best.categories.laborCostMax} pts${best.labor ? ` (${best.labor.overtimeHours}h OT, $${best.labor.overtimeCost.toLocaleString()})` : ''}</td>
+            </tr>
+            <tr>
+                <td style="padding: 8px 16px 8px 0; color: #64748b;">Reno/PC Adherence</td>
+                <td style="padding: 8px 0;">${best.categories.adherence}/${best.categories.adherenceMax} pts</td>
+            </tr>` : ''}
             <tr>
                 <td style="padding: 8px 16px 8px 0; color: #64748b;">Optimization Runs</td>
                 <td style="padding: 8px 0;">${totalIterations} iterations in ${durationMinutes} min</td>
