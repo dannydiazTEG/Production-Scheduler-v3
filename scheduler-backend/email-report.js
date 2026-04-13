@@ -337,7 +337,10 @@ async function sendOptimizationReport(data, recipients) {
     const detailedRecipients = recipients.detailed || ['danny.diaz@theescapegame.com'];
     const summaryRecipients = recipients.summary || [];
 
-    const subject = `Schedule Optimization: ${data.bestScore.feasible ? 'All NSO On-Time' : 'NSO Violations'} | Score ${data.bestScore.score.toLocaleString()} | ${data.totalIterations} runs`;
+    // New 0-100 scoring uses `compositeScore`; fall back to legacy `score` for older callers.
+    const scoreValue = data.bestScore.compositeScore ?? data.bestScore.score ?? 0;
+    const scoreLabel = typeof scoreValue === 'number' ? `${scoreValue}/100` : String(scoreValue);
+    const subject = `Schedule Optimization: ${data.bestScore.feasible ? 'All NSO On-Time' : 'NSO Violations'} | Score ${scoreLabel} | ${data.totalIterations} runs`;
 
     // Send detailed report
     if (detailedRecipients.length > 0) {

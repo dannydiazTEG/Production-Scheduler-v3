@@ -24,8 +24,11 @@ const Anthropic = require('@anthropic-ai/sdk');
 
 // --- Config ---
 const SERVER_URL = process.env.SERVER_URL || 'https://production-scheduler-backend-aepw.onrender.com';
-const MAX_ITERATIONS = parseInt(argOf('--iterations', '25'));
-const DEFAULT_HORIZON_MONTHS = parseInt(argOf('--horizon', '3'));
+// Iteration count: CLI flag wins, then env var, then default.
+// Using an env var lets Render dashboard overrides take effect immediately,
+// without waiting for render.yaml redeploys.
+const MAX_ITERATIONS = parseInt(argOf('--iterations', process.env.OPTIMIZER_ITERATIONS || '25'));
+const DEFAULT_HORIZON_MONTHS = parseInt(argOf('--horizon', process.env.OPTIMIZER_HORIZON || '3'));
 const DRY_RUN = process.argv.includes('--dry-run');
 const MODEL = process.env.OPTIMIZER_MODEL || 'claude-sonnet-4-5';
 
@@ -193,9 +196,12 @@ async function pollJob(jobId) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function runWithConfig(data, priorityWeights, horizonMonths, skipDbFilter = true) {
+function runWithConfig(data, priorityWeights, horizonMonths, skipDbFilter = true, preparedTasks = null) {
+    // CRITICAL: when preparedTasks is provided (from the baseline's DB-filtered result),
+    // use those as the projectTasks input and keep skipDbFilter=true. Otherwise the engine
+    // would re-simulate already-completed work on every iteration, breaking feasibility.
     return submitRun({
-        projectTasks: data.projectTasks,
+        projectTasks: preparedTasks || data.projectTasks,
         params: data.params,
         teamDefs: data.teamDefs,
         ptoEntries: data.ptoEntries || [],
@@ -208,6 +214,8 @@ function runWithConfig(data, priorityWeights, horizonMonths, skipDbFilter = true
         endDateOverrides: data.endDateOverrides || {},
         storeDueDatesCsv: data.storeDueDatesCsv,
         skipDbFilter,
+        // Ask server to echo the DB-filtered tasks back once, so we can reuse them.
+        returnPreparedTasks: !skipDbFilter,
         priorityWeights: priorityWeights || {},
         horizonMonths,
     });
@@ -383,15 +391,23 @@ async function main() {
     const data = await fetchJson(`${SERVER_URL}/api/optimization-data/latest`);
     console.log(`Loaded ${data.projectTasks.length} tasks\n`);
 
-    // 2. Baseline: default weights, fixed horizon
+    // 2. Baseline: default weights, fixed horizon, run DB-filter once to get a
+    // reusable task set for subsequent iterations.
     console.log(`=== BASELINE (default weights, horizon=${DEFAULT_HORIZON_MONTHS}mo) ===`);
     let baseResult;
+    let preparedTasks = null;
     if (DRY_RUN) {
         console.log('  (dry-run: skipping baseline schedule run)');
         baseResult = { score: { compositeScore: 0, grade: 'N/A', feasible: true, categories: {}, horizonMonths: DEFAULT_HORIZON_MONTHS, storesInScope: 0 }, configUsed: { priorityWeights: {} } };
     } else {
         baseResult = await runWithConfig(data, {}, DEFAULT_HORIZON_MONTHS, /* skipDbFilter */ false);
         logScore('Baseline', baseResult.score);
+        preparedTasks = baseResult.preparedTasks || null;
+        if (preparedTasks) {
+            console.log(`  Captured ${preparedTasks.length} DB-filtered tasks for reuse across iterations.`);
+        } else {
+            console.log(`  WARNING: server did not return preparedTasks. Subsequent runs may not match baseline.`);
+        }
     }
     const baseScore = baseResult.score;
 
@@ -441,7 +457,9 @@ async function main() {
         }
 
         try {
-            const result = await runWithConfig(data, proposal.priorityWeights, proposal.horizonMonths);
+            // Pass the baseline's DB-filtered task set so every iteration sees the
+            // same ground truth as the baseline did.
+            const result = await runWithConfig(data, proposal.priorityWeights, proposal.horizonMonths, /* skipDbFilter */ true, preparedTasks);
             const s = result.score;
             logScore(`Iter ${iter}`, s);
 
