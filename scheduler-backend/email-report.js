@@ -213,6 +213,110 @@ function renderStoreComparison(baselineBreakdown, bestBreakdown) {
     </table>`;
 }
 
+// Compact variance label for the multi-run table (keeps cells narrow).
+function renderVarianceCompact(s) {
+    if (!s) return '<span style="color: #94a3b8;">—</span>';
+    if (s.nsoStatus === 'WITHIN_TOLERANCE') {
+        return `<span style="color: #f59e0b; font-weight: bold;">+${s.latenessDays}d</span> <span style="font-size: 10px; color: #92400e;">(within ${s.toleranceDays}d)</span>`;
+    }
+    if (s.nsoStatus === 'EXCEEDS_TOLERANCE') {
+        return `<span style="color: #dc2626; font-weight: bold;">+${s.latenessDays}d</span> <span style="font-size: 10px; color: #dc2626;">(over)</span>`;
+    }
+    if (s.latenessDays > 0) return `<span style="color: #dc2626; font-weight: bold;">+${s.latenessDays}d</span>`;
+    if (s.daysEarly > 0) return `<span style="color: #16a34a; font-weight: bold;">-${s.daysEarly}d</span>`;
+    if (s.status === 'ON_TIME') return '<span style="color: #16a34a;">On Time</span>';
+    return '<span style="color: #94a3b8;">—</span>';
+}
+
+/**
+ * Render the top-N optimized runs' store-level finish dates alongside baseline,
+ * so the reader can compare which candidate schedule lands each store best.
+ *
+ * topRuns: [{ iteration, score, paramChanges, storeBreakdown: [...] }]
+ */
+function renderTopRunsComparison(baselineBreakdown, topRuns) {
+    if (!topRuns || topRuns.length === 0) return '';
+    const runs = topRuns.slice(0, 3);
+    const baseline = baselineBreakdown || [];
+
+    // Union of all stores across baseline + all runs, keyed by store name.
+    const storeOrder = [];
+    const seen = new Set();
+    const addStores = (arr) => {
+        for (const s of arr || []) {
+            if (!seen.has(s.store)) { seen.add(s.store); storeOrder.push(s.store); }
+        }
+    };
+    addStores(baseline);
+    for (const r of runs) addStores(r.storeBreakdown);
+
+    // Per-store lookup helpers
+    const baseByStore = new Map();
+    for (const s of baseline) baseByStore.set(s.store, s);
+    const runsByStore = runs.map(r => {
+        const map = new Map();
+        for (const s of r.storeBreakdown || []) map.set(s.store, s);
+        return map;
+    });
+
+    // Header row describing each run
+    const runHeaders = runs.map((r, i) => `
+        <th colspan="2" style="padding: 8px; text-align: left; border-bottom: 1px solid #cbd5e1; background: ${['#dbeafe', '#dcfce7', '#fef9c3'][i] || '#f1f5f9'};">
+            Run #${r.iteration} — ${r.score}/100
+            <div style="font-weight: normal; font-size: 11px; color: #475569; margin-top: 2px;">${escapeHtml(r.paramChanges || '')}</div>
+        </th>`).join('');
+    const runSubHeaders = runs.map((_, i) => {
+        const bg = ['#dbeafe', '#dcfce7', '#fef9c3'][i] || '#f1f5f9';
+        return `
+            <th style="padding: 6px 8px; text-align: left; border-bottom: 2px solid #cbd5e1; background: ${bg}; font-size: 12px;">Finish</th>
+            <th style="padding: 6px 8px; text-align: left; border-bottom: 2px solid #cbd5e1; background: ${bg}; font-size: 12px;">Variance</th>`;
+    }).join('');
+
+    const rows = storeOrder.map(storeName => {
+        const baseS = baseByStore.get(storeName);
+        const refForMeta = baseS || runsByStore.map(m => m.get(storeName)).find(Boolean);
+        const nsoTag = refForMeta?.isNso ? ' <span style="background: #fef3c7; color: #92400e; padding: 2px 6px; border-radius: 4px; font-size: 11px;">NSO</span>' : '';
+        const runCells = runsByStore.map(m => {
+            const s = m.get(storeName);
+            return `
+                <td style="padding: 8px; border-bottom: 1px solid #e2e8f0;">${s?.finishDate || '—'}</td>
+                <td style="padding: 8px; border-bottom: 1px solid #e2e8f0;">${renderVarianceCompact(s)}</td>`;
+        }).join('');
+        return `
+        <tr>
+            <td style="padding: 8px; border-bottom: 1px solid #e2e8f0;">${storeName}${nsoTag}</td>
+            <td style="padding: 8px; border-bottom: 1px solid #e2e8f0;">${refForMeta?.dueDate || 'N/A'}</td>
+            <td style="padding: 8px; border-bottom: 1px solid #e2e8f0;">${baseS?.finishDate || '—'}</td>
+            <td style="padding: 8px; border-bottom: 1px solid #e2e8f0;">${renderVarianceCompact(baseS)}</td>
+            ${runCells}
+        </tr>`;
+    }).join('');
+
+    return `
+    <h3 style="color: #1e293b; margin-top: 24px;">Top ${runs.length} Runs — Schedule Comparison</h3>
+    <p style="color: #64748b; font-size: 13px; margin: 0 0 8px;">Each run's predicted finish date and variance for every in-scope store, next to the baseline. Parameter changes shown in each run header.</p>
+    <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+        <thead>
+            <tr style="background: #f1f5f9;">
+                <th rowspan="2" style="padding: 8px; text-align: left; border-bottom: 2px solid #cbd5e1;">Store</th>
+                <th rowspan="2" style="padding: 8px; text-align: left; border-bottom: 2px solid #cbd5e1;">Due</th>
+                <th colspan="2" style="padding: 8px; text-align: left; border-bottom: 1px solid #cbd5e1; background: #e2e8f0;">Baseline</th>
+                ${runHeaders}
+            </tr>
+            <tr style="background: #f1f5f9;">
+                <th style="padding: 6px 8px; text-align: left; border-bottom: 2px solid #cbd5e1; background: #e2e8f0; font-size: 12px;">Finish</th>
+                <th style="padding: 6px 8px; text-align: left; border-bottom: 2px solid #cbd5e1; background: #e2e8f0; font-size: 12px;">Variance</th>
+                ${runSubHeaders}
+            </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function escapeHtml(s) {
+    return String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
 /**
  * Generate parameter diff table.
  */
@@ -284,7 +388,7 @@ function renderParamDiff(baselineConfig, bestConfig) {
  * Build the full HTML email.
  */
 function buildReportHtml(data, includeDetails) {
-    const { baselineScore, bestScore, bestConfig, runHistory, strategistNotes, totalIterations, durationMinutes } = data;
+    const { baselineScore, bestScore, bestConfig, runHistory, topRuns, strategistNotes, totalIterations, durationMinutes } = data;
 
     let html = `
     <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 700px; margin: 0 auto; color: #1e293b;">
@@ -297,6 +401,9 @@ function buildReportHtml(data, includeDetails) {
 
     if (includeDetails) {
         html += renderStoreComparison(baselineScore?.storeBreakdown, bestScore.storeBreakdown);
+        if (topRuns && topRuns.length > 0) {
+            html += renderTopRunsComparison(baselineScore?.storeBreakdown, topRuns);
+        }
         html += renderParamDiff(
             { headcounts: baselineScore._baselineHeadcounts, priorityWeights: {}, params: baselineScore._baselineParams, workHourOverrides: [] },
             bestConfig
