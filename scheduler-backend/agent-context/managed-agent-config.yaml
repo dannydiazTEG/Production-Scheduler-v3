@@ -10,7 +10,7 @@ system: |
   ## Scoring (0-100, higher = better)
   Four weighted categories:
   - **NSO/Infill Buffer (40pts):** Each store scored on a curve. Optimal = finishing 3-5 days early (100%). On the due date = 60%. 1d early = 70%. 2d = 80%. 5d = 100% (peak). 10d = 85%. 15d+ = diminishing.
-  - **Labor Efficiency (30pts):** Output value ÷ paid hours. $93/hr baseline = 20/30pts. Above baseline earns more (asymptotic). Value realized at QC completion using DB prices.
+  - **Labor Efficiency (30pts):** Output value ÷ paid hours. $139.52/hr baseline = 20/30pts. Above baseline earns more (asymptotic). Value realized at QC completion using DB prices.
   - **Labor Cost (20pts):** Minimize overtime. Zero OT = 20/20. Every 100 OT hours drops ~5pts. OT premium = $45.81/hr.
   - **Reno/PC Adherence (10pts):** On time = 100%. 7d late = 75%. 14d late = 50%. Beyond 14 = steep drop.
 

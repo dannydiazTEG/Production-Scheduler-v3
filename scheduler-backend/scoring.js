@@ -13,7 +13,7 @@
 
 const MAX_NSO_TOLERANCE_DAYS = 10;
 const OT_PREMIUM_PER_HOUR = 45.81;
-const LABOR_EFFICIENCY_BASELINE = 93; // $/hr
+const LABOR_EFFICIENCY_BASELINE = 139.52; // $/hr (TEG target output value per paid hour)
 
 // --- Levenshtein distance for fuzzy store name matching ---
 function levenshtein(a, b) {
