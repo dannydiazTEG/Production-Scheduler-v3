@@ -2509,7 +2509,7 @@ app.get('/api/schedule/status/:jobId', (req, res) => {
 });
 
 // --- Agent Optimization Endpoints ---
-const { scoreResult, parseDatesCsv, extractProjectTypeMap, trimEngineResult } = require('./scoring');
+const { scoreResult, parseDatesCsv, extractProjectTypeMap, trimEngineResult, getInHorizonStoreNames, normalizeStoreName } = require('./scoring');
 const { sendOptimizationReport } = require('./email-report');
 
 /**
@@ -2556,7 +2556,8 @@ app.post('/api/optimize-run', async (req, res) => {
         projectTasks, params, teamDefs, ptoEntries, teamMemberChanges,
         workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
         startDateOverrides, endDateOverrides,
-        priorityWeights, storeDueDatesCsv, skipDbFilter
+        priorityWeights, storeDueDatesCsv, skipDbFilter,
+        horizonMonths  // optional; when present (e.g. 3), restricts engine input + scoring to stores due within that window
     } = req.body;
 
     if (!projectTasks || !params || !teamDefs) {
@@ -2609,6 +2610,23 @@ app.post('/api/optimize-run', async (req, res) => {
                     configUsed: { params, priorityWeights: priorityWeights || {}, headcounts: teamDefs.headcounts }
                 };
                 return;
+            }
+
+            // --- Horizon filter (optional) ---
+            // When horizonMonths is provided, restrict both engine input (projectTasks) and
+            // scoring to stores with due dates within that window. Same cutoff is used for
+            // both so the engine and scorer see a consistent world.
+            let inHorizonStoreSet = null;
+            if (horizonMonths != null) {
+                const parsedDates = parseDatesCsv(storeDueDatesCsv);
+                inHorizonStoreSet = getInHorizonStoreNames(parsedDates, params.startDate, horizonMonths);
+                const beforeCount = preparedTasks.length;
+                preparedTasks = preparedTasks.filter(t => {
+                    const normalizedStore = normalizeStoreName(t.Store);
+                    return inHorizonStoreSet.has(normalizedStore);
+                });
+                console.log(`[Job ${jobId}] Horizon filter (${horizonMonths}mo): ${inHorizonStoreSet.size} stores in scope, ${preparedTasks.length}/${beforeCount} tasks retained.`);
+                updateProgress(12, `Horizon filter: ${inHorizonStoreSet.size} stores in next ${horizonMonths} months`, 'filtering');
             }
 
             updateProgress(15, 'Running scheduling engine...', 'simulating');
@@ -2666,6 +2684,8 @@ app.post('/api/optimize-run', async (req, res) => {
             const scoreData = scoreResult(engineResult, storeDueDates, {
                 standardHoursPerDay: parseFloat(params.hoursPerDay) || 8,
                 priceMap,
+                inHorizonStores: inHorizonStoreSet,
+                horizonMonths: horizonMonths != null ? Number(horizonMonths) : null,
             });
             const projectTypeMap = extractProjectTypeMap(engineResult.finalSchedule || []);
             const trimmed = trimEngineResult(engineResult);

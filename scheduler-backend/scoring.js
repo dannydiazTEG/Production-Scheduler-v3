@@ -71,6 +71,33 @@ function calendarDays(dateA, dateB) {
     return Math.round((a - b) / (24 * 60 * 60 * 1000));
 }
 
+// --- Horizon filter helper ---
+/**
+ * Build the set of normalized store names whose due date falls within the horizon window.
+ *
+ * @param {Map<string, {dueDate: string}>} storeDueDates - from parseDatesCsv()
+ * @param {string|Date} startDate - simulation start (params.startDate). Falls back to today.
+ * @param {number} horizonMonths - months from startDate; null/undefined returns null (no filter)
+ * @returns {Set<string>|null} Set of normalized store names, or null when no filter is active.
+ */
+function getInHorizonStoreNames(storeDueDates, startDate, horizonMonths) {
+    if (horizonMonths == null) return null;
+    const base = startDate ? parseLocalDate(startDate) : new Date();
+    base.setHours(0, 0, 0, 0);
+    const cutoff = new Date(base.getTime());
+    cutoff.setMonth(cutoff.getMonth() + Number(horizonMonths));
+
+    const result = new Set();
+    for (const [storeName, val] of storeDueDates.entries()) {
+        const dueStr = typeof val === 'object' ? val.dueDate : val;
+        const due = parseLocalDate(dueStr);
+        if (!isNaN(due) && due <= cutoff) {
+            result.add(normalizeStoreName(storeName));
+        }
+    }
+    return result;
+}
+
 // --- NSO/Infill tolerance ---
 function getNsoTolerance(dueDate, today) {
     const now = today ? new Date(today.getTime()) : new Date();
@@ -206,6 +233,8 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
         standardHoursPerDay = 8,
         today,
         priceMap = new Map(),
+        inHorizonStores = null,  // Set<normalizedStoreName>|null — when set, scoring is restricted to these stores
+        horizonMonths = null,
     } = options;
 
     const { finalSchedule, projectSummary, teamUtilization, weeklyOutput, teamWorkload } = engineResult;
@@ -266,6 +295,10 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
                 store, projectTypes: Array.from(data.projectTypes),
                 finishDate: data.maxFinishDate, dueDate: null, latenessDays: 0, status: 'NO_DUE_DATE',
             });
+            continue;
+        }
+        // Horizon filter: skip stores outside the scoring window (if one is set)
+        if (inHorizonStores && !inHorizonStores.has(normalizeStoreName(match.matched))) {
             continue;
         }
 
@@ -411,11 +444,14 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
     const totalLateness = storeBreakdown.reduce((s, st) => s + (st.latenessDays || 0), 0);
 
     // --- Grade ---
+    const scoredStoreCount = storeBreakdown.filter(s => s.status !== 'NO_DUE_DATE').length;
     const result = {
         compositeScore,
         feasible,
         onTimeRate,
         totalLateness,
+        horizonMonths,
+        storesInScope: scoredStoreCount,
 
         categories: {
             buffer: Number(bufferPoints.toFixed(1)),
@@ -542,6 +578,9 @@ module.exports = {
     extractProjectTypeMap,
     trimEngineResult,
     matchStoreName,
+    normalizeStoreName,
+    parseLocalDate,
+    getInHorizonStoreNames,
     calendarDays,
     getNsoTolerance,
     analyzeTeamHealth,

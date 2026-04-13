@@ -22,3 +22,7 @@ services:
         value: https://production-scheduler-backend-aepw.onrender.com
       - key: NODE_ENV
         value: production
+      # ANTHROPIC_API_KEY must be set via the Render dashboard (never commit the key).
+      # It is required — optimizer-cron.js exits on startup without it.
+      - key: ANTHROPIC_API_KEY
+        sync: false

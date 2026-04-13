@@ -79,10 +79,25 @@ Array of `{ name, primaryTeam, secondaryTeam }`. These workers split time betwee
 
 **Impact:** Can help balance utilization between overloaded and underloaded teams.
 
+## 7. Horizon (`horizonMonths`)
+
+| Parameter | Default | Range | Effect |
+|-----------|---------|-------|--------|
+| `horizonMonths` | 3 | 3-12 | Restricts both engine input and scoring to stores whose production due dates fall within this many months of the schedule start. Stores beyond the horizon are ignored entirely. |
+
+**Why it matters:** Danny releases new schedules every 6-8 weeks. Simulating a full year on every iteration wastes compute — a 3-month horizon cuts per-iteration time ~3× and sharpens the score signal by only grading stores we'll actually ship soon.
+
+**Guidance:**
+- **Start at 3.** It's the default for this overnight run and produces the cleanest near-term signal.
+- **Only expand** (to 4, 5, ...) if the scores plateau and you have a specific reason to believe broader context would change the best parameter set (e.g., you suspect a 4-month-out NSO is pulling too much work forward and the 3mo view can't see it).
+- **Never go below 3.** Too short to meaningfully cover the planning horizon.
+- **Don't oscillate** — if you change horizon, commit to at least 2-3 iterations at the new value before switching back, so you can tell if the score change came from the horizon or the weights.
+
 ## Tuning Strategy
 
 1. **Start with priority weights** — they're the cheapest to change and have immediate effect
 2. **Then headcounts** — find the true bottleneck team(s) by looking at utilization data
 3. **Then overtime** — targeted OT for the bottleneck team(s) during critical periods
 4. **Then params** — productivityAssumption and globalBuffer trade safety margin vs throughput
-5. **Last: teamMemberChanges and hybridWorkers** — model staffing scenarios
+5. **Horizon expansion** — only once you're converging near a ceiling at 3mo
+6. **Last: teamMemberChanges and hybridWorkers** — model staffing scenarios
