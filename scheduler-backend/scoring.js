@@ -514,19 +514,51 @@ function computeGrade(scoreData) {
 
 /**
  * Analyze utilization valleys and workload peaks.
+ *
+ * Valleys report only *mid-schedule* underutilization per team — the dips that
+ * represent real scheduling opportunities. We drop ramp-up (tail before a team's
+ * first meaningful workload) and wind-down (tail after their last). Previously
+ * every tail week got flagged, burying the few interesting middle-of-schedule
+ * valleys under noise.
+ *
+ * A team's "active window" is bounded by the first and last week where utilization
+ * ≥ VALLEY_THRESHOLD. Valleys between those bookends (inclusive of edges) are
+ * reported; anything outside is considered ramp-up/wind-down and skipped.
  */
 function analyzeTeamHealth(teamUtilization, teamWorkload) {
     const EXCLUDED_TEAMS = new Set(['Receiving', 'QC', 'Hybrid']);
     const VALLEY_THRESHOLD = 40;
     const PEAK_THRESHOLD = 150;
 
-    const valleys = [];
+    // Build per-team series so we can find each team's active window.
+    const teamSeries = new Map(); // teamName -> [{week, util}, ...] in chronological order
     for (const weekData of (teamUtilization || [])) {
         for (const team of weekData.teams) {
             if (EXCLUDED_TEAMS.has(team.name)) continue;
-            const util = team.utilization || 0;
+            if (!teamSeries.has(team.name)) teamSeries.set(team.name, []);
+            teamSeries.get(team.name).push({ week: weekData.week, util: team.utilization || 0 });
+        }
+    }
+
+    const valleys = [];
+    for (const [teamName, series] of teamSeries.entries()) {
+        // Find first and last week where this team's utilization was at or above the
+        // valley threshold — those mark the meaningful "middle" of its schedule.
+        let firstActiveIdx = -1;
+        let lastActiveIdx = -1;
+        for (let i = 0; i < series.length; i++) {
+            if (series[i].util >= VALLEY_THRESHOLD) {
+                if (firstActiveIdx === -1) firstActiveIdx = i;
+                lastActiveIdx = i;
+            }
+        }
+        // If a team never crossed the threshold, there's no "middle" to speak of — skip.
+        if (firstActiveIdx === -1) continue;
+
+        for (let i = firstActiveIdx; i <= lastActiveIdx; i++) {
+            const { week, util } = series[i];
             if (util > 0 && util < VALLEY_THRESHOLD) {
-                valleys.push({ week: weekData.week, team: team.name, utilization: util });
+                valleys.push({ week, team: teamName, utilization: util });
             }
         }
     }
