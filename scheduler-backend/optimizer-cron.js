@@ -116,12 +116,60 @@ async function fetchJson(url, options) {
 }
 
 async function submitRun(body) {
-    const { jobId } = await fetchJson(`${SERVER_URL}/api/optimize-run`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-    });
-    return pollJob(jobId);
+    // Handle 503 "already in progress" — wait for the existing job to drain, then submit.
+    // This keeps the cron resilient to collisions with UI-triggered runs, the scheduled-task
+    // MCP, or leftover runs from earlier in the day.
+    let attempts = 0;
+    const MAX_BUSY_WAITS = 30; // up to ~30 × 5min = 2.5 hours of patience
+    while (attempts < MAX_BUSY_WAITS) {
+        const resp = await fetch(`${SERVER_URL}/api/optimize-run`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+
+        if (resp.ok) {
+            const { jobId } = await resp.json();
+            return pollJob(jobId);
+        }
+
+        if (resp.status === 503) {
+            const payload = await resp.json().catch(() => ({}));
+            if (payload.existingJobId) {
+                console.log(`  Server busy (existing job ${payload.existingJobId.slice(0, 8)}...). Waiting for it to finish before retrying.`);
+                try {
+                    await waitForJobToFinish(payload.existingJobId);
+                } catch (e) {
+                    console.log(`  Existing job ended (${e.message}). Retrying submission.`);
+                }
+                attempts += 1;
+                await sleep(5000); // brief settle time before retry
+                continue;
+            }
+        }
+
+        const text = await resp.text();
+        throw new Error(`HTTP ${resp.status}: ${text.slice(0, 200)}`);
+    }
+    throw new Error(`Timed out waiting for server to free up after ${MAX_BUSY_WAITS} attempts.`);
+}
+
+// Poll a job to terminal state without caring about result shape — used when we're
+// just waiting for someone else's job to drain so we can submit our own.
+async function waitForJobToFinish(jobId) {
+    for (let i = 0; i < 120; i++) {
+        await sleep(10000);
+        try {
+            const resp = await fetch(`${SERVER_URL}/api/schedule/status/${jobId}`);
+            if (resp.status === 404) return; // job expired — it's gone, safe to submit
+            if (!resp.ok) continue;
+            const job = await resp.json();
+            if (job.status === 'complete' || job.status === 'error') return;
+        } catch (e) {
+            // transient polling error — keep trying
+        }
+    }
+    throw new Error(`Gave up waiting for job ${jobId.slice(0, 8)}...`);
 }
 
 async function pollJob(jobId) {
