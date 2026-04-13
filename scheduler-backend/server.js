@@ -2709,6 +2709,11 @@ app.post('/api/optimize-run', async (req, res) => {
                     teamMemberChanges: teamMemberChanges || [],
                     hybridWorkers: hybridWorkers || []
                 },
+                // Include prepared tasks only when the optimizer-cron asks for them
+                // (skipDbFilter: false with returnPreparedTasks: true). This lets the
+                // cron run the DB filter ONCE in the baseline, then reuse the filtered
+                // task set for all subsequent iterations without re-querying Postgres.
+                preparedTasks: (req.body.returnPreparedTasks && !skipDbFilter) ? preparedTasks : undefined,
                 logs: (trimmed.logs || []).slice(-30)
             };
 
