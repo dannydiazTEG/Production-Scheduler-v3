@@ -10,6 +10,8 @@
 // Callers are responsible for preparing task data before calling.
 // =================================================================
 
+const { NOOP_TIMINGS } = require('./timings');
+
 // --- Default Priority Weights ---
 // These are the 12 tunable parameters that drive the priority scoring formula.
 // Pass a partial override object as the last argument to runSchedulingEngine()
@@ -95,10 +97,18 @@ const runSchedulingEngine = async (
     workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
     startDateOverrides, endDateOverrides,
     updateProgress,
-    priorityWeights
+    priorityWeights,
+    timings = NOOP_TIMINGS
 ) => {
     const logs = [];
     let error = '';
+    timings.mark('engine.total.start');
+    timings.mark('engine.setup.start');
+    timings.note('inputTaskCount', preparedTasks.length);
+    // perf_hooks.performance.now() is used for hot-path deltas. Must be
+    // bound to the performance object or Node errors on `this` check.
+    const _perf = require('perf_hooks').performance;
+    const perfNow = () => _perf.now();
 
     // Merge caller-provided weight overrides with defaults
     const weights = { ...DEFAULT_PRIORITY_WEIGHTS, ...priorityWeights };
@@ -506,6 +516,9 @@ const runSchedulingEngine = async (
         const completionBySkuOrder = new Map(); // key: "Project|SKU|Order" -> Date
         const maxIdleDays = parseFloat(params.maxIdleDays) || weights.dwellThresholdDays;
 
+        timings.mark('engine.setup.end');
+        timings.mark('engine.mainLoop.start');
+
         while(unscheduled_tasks.length > 0 && loopCounter < maxDays) {
             const dayOfWeek = current_date.getDay();
             const currentDateStr = formatDate(current_date);
@@ -533,12 +546,14 @@ const runSchedulingEngine = async (
             };
 
             const isReady = (task) => {
-                if (current_date < task.StartDate) return false;
+                const _t0 = perfNow();
+                timings.bump('isReady.calls');
+                if (current_date < task.StartDate) { timings.inc('isReady.ms', perfNow() - _t0); return false; }
 
                 // Delayed SKU gate: don't start until calculated late-start date
                 const skuKey = `${task.Project}|${task.SKU}`;
                 const lateStartDate = delayedSkuStartDates.get(skuKey);
-                if (lateStartDate && current_date < lateStartDate) return false;
+                if (lateStartDate && current_date < lateStartDate) { timings.inc('isReady.ms', perfNow() - _t0); return false; }
 
                 const key = `${task.Project}|${task.SKU}`;
                 const allSkuTasks = schedulableTasksMap.get(key) || [];
@@ -549,12 +564,16 @@ const runSchedulingEngine = async (
                     // (handles cases like D-104 where Final Assembly IS the first op)
                     const taskGroupInfo = assemblyGroupTaskLookup.get(task.TaskID);
                     if (taskGroupInfo && taskGroupInfo.isFinalAssembly) {
-                        return checkAssemblyGroupReady(task, taskGroupInfo.groupKey);
+                        const r = checkAssemblyGroupReady(task, taskGroupInfo.groupKey);
+                        timings.inc('isReady.ms', perfNow() - _t0);
+                        return r;
                     }
+                    timings.inc('isReady.ms', perfNow() - _t0);
                     return true;
                 }
 
                 const predecessorsReady = predecessors.every(p => {
+                    timings.bump('isReady.completedOpsFind');
                     const completedPredecessor = completed_operations.find(c => c.TaskID === p.TaskID);
                     if (!completedPredecessor) {
                         return false; // Predecessor isn't done yet
@@ -581,15 +600,18 @@ const runSchedulingEngine = async (
                     return current_date >= readyDate;
                 });
 
-                if (!predecessorsReady) return false;
+                if (!predecessorsReady) { timings.inc('isReady.ms', perfNow() - _t0); return false; }
 
                 // Assembly Group gate: if this is Final Assembly in a group,
                 // all sibling SKUs must have their pre-assembly work done
                 const taskGroupInfo = assemblyGroupTaskLookup.get(task.TaskID);
                 if (taskGroupInfo && taskGroupInfo.isFinalAssembly) {
-                    return checkAssemblyGroupReady(task, taskGroupInfo.groupKey);
+                    const r = checkAssemblyGroupReady(task, taskGroupInfo.groupKey);
+                    timings.inc('isReady.ms', perfNow() - _t0);
+                    return r;
                 }
 
+                timings.inc('isReady.ms', perfNow() - _t0);
                 return true;
             };
             // --- END MODIFICATION ---
@@ -604,6 +626,7 @@ const runSchedulingEngine = async (
             });
             dailyDwellingData[currentDateStr] = dwellingHoursToday;
 
+            const _pPriStart = perfNow();
             unscheduled_tasks.forEach(task => {
                 const daysUntilDue = (task.DueDate - current_date) / (1000 * 60 * 60 * 24);
                 let dueDateMultiplier;
@@ -667,9 +690,11 @@ const runSchedulingEngine = async (
                 task._dwellMultiplier = dwellMultiplier;
                 task._inProgressMultiplier = inProgressMultiplier;
             });
+            timings.inc('priorityCalc.ms', perfNow() - _pPriStart);
 
             // Capture priority snapshots weekly (Mondays) with top 50 tasks to keep response size manageable
             if (current_date.getDay() === 1) {
+                const _sStart = perfNow();
                 const readyForSnapshot = unscheduled_tasks.filter(t => t.HoursRemaining > 0);
                 readyForSnapshot.sort((a, b) => b.DynamicPriority - a.DynamicPriority);
                 const topTasks = readyForSnapshot.slice(0, 50);
@@ -700,6 +725,7 @@ const runSchedulingEngine = async (
                         DaysSinceLastStep: 0,
                     });
                 });
+                timings.inc('snapshots.ms', perfNow() - _sStart);
             }
 
             const dailyRoster = {};
@@ -750,6 +776,7 @@ const runSchedulingEngine = async (
             const dailyHoursMap = {};
             Object.keys(dailyRoster).forEach(team => {
                 let hours = parseFloat(params.hoursPerDay);
+                timings.bump('workHourOverrides.find');
                 const override = workHourOverrides.find(o => o.team === team && currentDateStr >= o.startDate && currentDateStr <= o.endDate);
 
                 // Check overtime constraints
@@ -863,8 +890,10 @@ const runSchedulingEngine = async (
 
             let skus_being_worked_on_today = new Set();
             let more_work_to_assign_today = true;
+            const _aStart = perfNow();
 
             while (more_work_to_assign_today) {
+                timings.bump('assignment.passes');
                 more_work_to_assign_today = false;
                 const ready_tasks = unscheduled_tasks.filter(isReady).sort((a,b) => b.DynamicPriority - a.DynamicPriority);
 
@@ -938,6 +967,8 @@ const runSchedulingEngine = async (
                 // Yield to event loop between work-assignment passes so HTTP requests don't queue up
                 await yieldToEventLoop();
             }
+            timings.inc('assignment.ms', perfNow() - _aStart);
+            timings.bump('mainLoop.workDays');
             // Throttle progress updates to every 5 days, but yield every day to keep server responsive
             if (loopCounter % 5 === 0) {
                 const progress = 15 + Math.round((totalHoursCompleted / totalWorkloadHours) * 75);
@@ -948,7 +979,10 @@ const runSchedulingEngine = async (
             current_date.setDate(current_date.getDate() + 1);
             loopCounter++;
         }
-        
+
+        timings.mark('engine.mainLoop.end');
+        timings.note('mainLoopIterations', loopCounter);
+        timings.mark('engine.finalize.start');
         updateProgress(90, 'Finalizing results...');
 
         // Track work by team member to see if new hires did anything
@@ -1130,6 +1164,9 @@ const runSchedulingEngine = async (
         });
 
 
+        timings.mark('engine.finalize.end');
+        timings.mark('engine.total.end');
+
         return {
             finalSchedule,
             projectSummary,
@@ -1142,13 +1179,15 @@ const runSchedulingEngine = async (
             dailyPrioritySnapshots,
             completedOperations: completed_operations,
             logs,
-            error
+            error,
+            timings: timings.report(),
         };
 
     } catch (e) {
         console.error("Critical error in scheduling engine:", e);
         logs.push(`Critical Error: ${e.message}`);
-        return { error: `A critical error occurred on the server: ${e.message}`, logs };
+        timings.mark('engine.total.end');
+        return { error: `A critical error occurred on the server: ${e.message}`, logs, timings: timings.report() };
     }
 };
 
