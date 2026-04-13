@@ -935,12 +935,15 @@ const runSchedulingEngine = async (
                     }
                 }
                 unscheduled_tasks = unscheduled_tasks.filter(t => t.HoursRemaining > 0.01);
+                // Yield to event loop between work-assignment passes so HTTP requests don't queue up
+                await yieldToEventLoop();
             }
+            // Throttle progress updates to every 5 days, but yield every day to keep server responsive
             if (loopCounter % 5 === 0) {
                 const progress = 15 + Math.round((totalHoursCompleted / totalWorkloadHours) * 75);
                 updateProgress(progress, `Simulating Day ${loopCounter + 1}...`);
-                await yieldToEventLoop();
             }
+            await yieldToEventLoop();
 
             current_date.setDate(current_date.getDate() + 1);
             loopCounter++;
@@ -1020,6 +1023,8 @@ const runSchedulingEngine = async (
         const weeklyCapacityMap = {};
         const allWeeksForCapacity = new Set(Object.keys(weeklyUtil).concat(Object.keys(dailyDwellingData).map(d => formatDate(getWeekStartDate(parseDate(d))))));
         for (const week of Array.from(allWeeksForCapacity).sort()) {
+            // Yield between weeks so HTTP requests stay responsive during post-sim aggregation
+            await yieldToEventLoop();
             const weekStartDate = parseDate(week);
             weeklyCapacityMap[week] = {};
             let weeklyHybridCapacity = 0;

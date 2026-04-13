@@ -76,6 +76,9 @@ const jobs = {};
 
 // --- JOB CLEANUP TO PREVENT MEMORY LEAKS ---
 const JOB_RETENTION_MS = 5 * 60 * 1000;       // 5 minutes (was 1 hour)
+const OPTIMIZE_RUN_RETENTION_MS = 30 * 60 * 1000;   // 30 min — cron polls slowly between iterations
+const SAFETY_NET_MS = 15 * 60 * 1000;             // 15 min default safety net
+const OPTIMIZE_RUN_SAFETY_NET_MS = 2 * 60 * 60 * 1000; // 2 hours for long-running optimize-runs
 const CLEANUP_INTERVAL_MS = 30 * 1000;          // 30 seconds (was 10 minutes)
 const MAX_JOBS = 5;                             // Max concurrent jobs in memory
 const MAX_LOG_LINES = 200;                      // Max log entries stored per job result
@@ -88,24 +91,28 @@ function cleanupOldJobs() {
     for (const jobId in jobs) {
         const job = jobs[jobId];
         const age = now - (job.createdAt || 0);
+        const isOptimizeRun = job.type === 'optimize-run';
+        const retentionMs = isOptimizeRun ? OPTIMIZE_RUN_RETENTION_MS : JOB_RETENTION_MS;
+        const safetyNetMs = isOptimizeRun ? OPTIMIZE_RUN_SAFETY_NET_MS : SAFETY_NET_MS;
 
         // Remove terminal jobs older than retention period
-        if ((job.status === 'complete' || job.status === 'error') && age > JOB_RETENTION_MS) {
+        if ((job.status === 'complete' || job.status === 'error') && age > retentionMs) {
             delete jobs[jobId];
             removedCount++;
             continue;
         }
-        // Safety net: remove ANY job older than 15 minutes regardless of status
+        // Safety net: remove ANY job older than the safety threshold regardless of status
         // (catches stuck 'running' jobs from crashes)
-        if (age > 15 * 60 * 1000) {
-            console.warn(`[Cleanup] Removing stale job ${jobId} (status: ${job.status}, age: ${(age / 1000 / 60).toFixed(1)}min)`);
+        if (age > safetyNetMs) {
+            console.warn(`[Cleanup] Removing stale job ${jobId} (status: ${job.status}, type: ${job.type || 'default'}, age: ${(age / 1000 / 60).toFixed(1)}min)`);
             delete jobs[jobId];
             removedCount++;
             continue;
         }
         // Strip undelivered results from completed jobs older than 2 minutes
-        // (client probably navigated away without fetching)
-        if (job.status === 'complete' && job.result && age > 2 * 60 * 1000) {
+        // (client probably navigated away without fetching).
+        // Skip for optimize-run — cron may poll multiple times across the retention window.
+        if (!isOptimizeRun && job.status === 'complete' && job.result && age > 2 * 60 * 1000) {
             console.log(`[Cleanup] Stripping undelivered result from job ${jobId}`);
             job.result = null;
         }
@@ -2516,6 +2523,17 @@ app.post('/api/optimize-run', async (req, res) => {
     const heapUsedMB = process.memoryUsage().heapUsed / 1024 / 1024;
     if (heapUsedMB > MEMORY_THRESHOLD_MB) {
         return res.status(503).json({ error: `Memory circuit breaker: ${heapUsedMB.toFixed(0)}MB heap used.` });
+    }
+    // Reject if another optimize-run is already in flight — running two engine instances on
+    // a single Node process doubles CPU contention and slows polling badly.
+    const existingOptimizeRun = Object.entries(jobs).find(([, j]) =>
+        j.type === 'optimize-run' && (j.status === 'running' || j.status === 'pending')
+    );
+    if (existingOptimizeRun) {
+        return res.status(503).json({
+            error: 'An optimize-run is already in progress.',
+            existingJobId: existingOptimizeRun[0],
+        });
     }
     const activeJobCount = Object.values(jobs).filter(j => j.status === 'running' || j.status === 'pending').length;
     if (activeJobCount >= MAX_JOBS) {
