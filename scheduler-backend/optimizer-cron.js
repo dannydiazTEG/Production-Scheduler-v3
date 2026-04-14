@@ -904,10 +904,13 @@ async function main() {
     // Build the top-N feasible runs so the email can show a schedule comparison
     // across multiple strong candidates, not just the winner. These carry their
     // full storeBreakdown so the report can render Store | Due | Baseline | #1 | #2 | #3.
+    // Include top runs regardless of feasibility — infeasible runs still show useful
+    // store-by-store finish dates for debugging why stores are late. Sort feasible first,
+    // then by score descending, so the comparison table leads with the best viable options.
     const TOP_N = 3;
     const topRuns = history
-        .filter(h => h.feasible && h.iteration > 0 && Array.isArray(h.storeBreakdown) && h.storeBreakdown.length > 0)
-        .sort((a, b) => b.score - a.score)
+        .filter(h => h.iteration > 0 && Array.isArray(h.storeBreakdown) && h.storeBreakdown.length > 0)
+        .sort((a, b) => (b.feasible - a.feasible) || (b.score - a.score))
         .slice(0, TOP_N)
         .map(h => ({
             iteration: h.iteration,
@@ -927,13 +930,15 @@ async function main() {
     const attachments = [];
 
     // 1. Comparison CSV — one row per store per feasible run, for spreadsheet analysis.
-    const feasibleRuns = history.filter(h => h.feasible && h.iteration > 0 && h.storeBreakdown?.length > 0);
-    if (feasibleRuns.length > 0) {
-        const csvRows = ['Run,Score,Horizon,Parameters,Store,Types,Due Date,Finish Date,Variance Days,Early Days,NSO Status'];
-        for (const run of feasibleRuns) {
+    // Include all scored runs (feasible or not) in the comparison CSV — infeasible runs
+    // are still useful for understanding what's blocking stores.
+    const scoredRuns = history.filter(h => h.iteration > 0 && h.storeBreakdown?.length > 0);
+    if (scoredRuns.length > 0) {
+        const csvRows = ['Run,Score,Feasible,Horizon,Parameters,Store,Types,Due Date,Finish Date,Variance Days,Early Days,NSO Status'];
+        for (const run of scoredRuns) {
             for (const s of run.storeBreakdown) {
                 csvRows.push([
-                    run.iteration, run.score, run.horizonMonths,
+                    run.iteration, run.score, run.feasible ? 'Yes' : 'No', run.horizonMonths,
                     `"${(run.paramChanges || '').replace(/"/g, '""')}"`,
                     `"${(s.store || '').replace(/"/g, '""')}"`,
                     `"${(s.projectTypes || []).join(', ')}"`,
@@ -947,7 +952,7 @@ async function main() {
             filename: `schedule-comparison-${startDateStr}.csv`,
             content: csvRows.join('\n'),
         });
-        console.log(`  CSV attachment: ${feasibleRuns.length} feasible runs × ${feasibleRuns[0]?.storeBreakdown?.length || 0} stores`);
+        console.log(`  CSV attachment: ${scoredRuns.length} runs × ${scoredRuns[0]?.storeBreakdown?.length || 0} stores`);
     }
 
     // 2. Config JSONs for top runs — the exact settings needed to reproduce each candidate.
