@@ -476,6 +476,11 @@ async function main() {
                 horizonMonths: proposal.horizonMonths,
                 paramChanges: describeProposal(proposal),
                 reasoning: proposal.reasoning,
+                priorityWeights: proposal.priorityWeights || {},
+                // Keep the per-store breakdown so we can build a top-3 comparison
+                // table in the email report at the end of the run.
+                storeBreakdown: s.storeBreakdown || [],
+                categories: s.categories || null,
             });
         } catch (e) {
             console.log(`  Run error: ${e.message}`);
@@ -512,8 +517,29 @@ async function main() {
         return;
     }
 
-    console.log('Sending report email...');
+    // Build the top-N feasible runs so the email can show a schedule comparison
+    // across multiple strong candidates, not just the winner. These carry their
+    // full storeBreakdown so the report can render Store | Due | Baseline | #1 | #2 | #3.
+    const TOP_N = 3;
+    const topRuns = history
+        .filter(h => h.feasible && h.iteration > 0 && Array.isArray(h.storeBreakdown) && h.storeBreakdown.length > 0)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, TOP_N)
+        .map(h => ({
+            iteration: h.iteration,
+            score: h.score,
+            horizonMonths: h.horizonMonths,
+            paramChanges: h.paramChanges,
+            priorityWeights: h.priorityWeights,
+            storeBreakdown: h.storeBreakdown,
+            categories: h.categories,
+        }));
+
+    console.log(`Sending report email (including top ${topRuns.length} runs)...`);
     try {
+        // Strip storeBreakdown from the full history to keep the email payload small —
+        // topRuns already carries the breakdowns we care about.
+        const compactHistory = history.map(({ storeBreakdown, ...rest }) => rest);
         const reportResp = await fetchJson(`${SERVER_URL}/api/send-optimization-report`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -521,7 +547,8 @@ async function main() {
                 baselineScore: baseScore,
                 bestScore,
                 bestConfig,
-                runHistory: history,
+                runHistory: compactHistory,
+                topRuns,
                 strategistNotes: narrativeResult.text,
                 totalIterations: history.length,
                 durationMinutes: elapsed,

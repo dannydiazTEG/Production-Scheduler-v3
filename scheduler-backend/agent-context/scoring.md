@@ -27,9 +27,9 @@ Each NSO/Infill store is scored individually, then averaged and scaled to 40 poi
 ### Labor Efficiency — 30 points max
 `Output Value ÷ Total Paid Hours`. Value is realized when QC completes each SKU, using prices from the database (`raw_fulcrum_price_breaks` table).
 
-- $93/hr = 20 out of 30 points (baseline target)
-- Every dollar above $93 earns proportionally more (asymptotic curve)
-- Below $93 scales down proportionally
+- $139.52/hr = 20 out of 30 points (baseline target)
+- Every dollar above $139.52 earns proportionally more (asymptotic curve)
+- Below $139.52 scales down proportionally
 - Baseline measures at $109.67/hr = 25.4/30
 
 ### Labor Cost — 20 points max

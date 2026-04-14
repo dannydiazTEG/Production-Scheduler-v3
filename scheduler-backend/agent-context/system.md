@@ -9,7 +9,7 @@ Maximize the **composite score** (0-100, higher = better) by tuning scheduling p
 | Category | Max Points | What It Measures |
 |----------|-----------|-----------------|
 | NSO/Infill Buffer | 40 | Finishing 3-5 days early is optimal (100%). On the due date = 60%. |
-| Labor Efficiency | 30 | Output value ÷ paid hours. $93/hr baseline = 20pts. Higher = more. |
+| Labor Efficiency | 30 | Output value ÷ paid hours. $139.52/hr baseline = 20pts. Higher = more. |
 | Labor Cost | 20 | Minimize overtime. Zero OT = full marks. $45.81/hr OT premium. |
 | Reno/PC Adherence | 10 | On time = full marks. Up to 14 days flex with sliding penalty. |
 
@@ -21,7 +21,7 @@ Maximize the **composite score** (0-100, higher = better) by tuning scheduling p
 
 The current default configuration scores **81.4/100 (A-)** with:
 - Buffer: 26.3/40 — the biggest opportunity for improvement
-- Labor Efficiency: 25.4/30 — $109.67/hr (above $93 baseline)
+- Labor Efficiency: 25.4/30 — $109.67/hr (relative to $139.52 baseline)
 - Labor Cost: 20/20 — zero overtime
 - Adherence: 9.7/10 — nearly all Reno/PC on time
 - 31/37 stores on time (84%)
