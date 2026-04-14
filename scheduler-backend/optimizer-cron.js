@@ -32,6 +32,17 @@ const DEFAULT_HORIZON_MONTHS = parseInt(argOf('--horizon', process.env.OPTIMIZER
 const DRY_RUN = process.argv.includes('--dry-run');
 const MODEL = process.env.OPTIMIZER_MODEL || 'claude-sonnet-4-5';
 
+// Start date offset: 0 = today (daily mode), 3 = today+3 days (deep mode, gives leads prep time).
+const START_OFFSET_DAYS = parseInt(process.env.OPTIMIZER_START_OFFSET_DAYS || '0');
+
+// Email recipients — comma-separated list via env var or CLI.
+// Defaults to Danny only (no summary recipients) for safe test runs.
+const RECIPIENTS_RAW = argOf('--recipients', process.env.OPTIMIZER_RECIPIENTS || 'danny.diaz@theescapegame.com');
+const EMAIL_RECIPIENTS = {
+    detailed: RECIPIENTS_RAW.split(',').map(e => e.trim()).filter(Boolean),
+    summary: [],  // Summary recipients (e.g. Dan Oliver) added once output is validated
+};
+
 function argOf(flag, fallback) {
     const idx = process.argv.indexOf(flag);
     return idx !== -1 && idx + 1 < process.argv.length ? process.argv[idx + 1] : fallback;
@@ -382,6 +393,7 @@ async function main() {
     console.log(`Model: ${MODEL}`);
     console.log(`Server: ${SERVER_URL}`);
     console.log(`Iterations: ${MAX_ITERATIONS} | Default horizon: ${DEFAULT_HORIZON_MONTHS}mo | Dry-run: ${DRY_RUN}`);
+    console.log(`Email recipients: ${EMAIL_RECIPIENTS.detailed.join(', ') || '(none)'}`);
     console.log(`Time: ${new Date().toISOString()}\n`);
 
     const tokenAcc = { inputTokens: 0, outputTokens: 0, calls: 0 };
@@ -389,7 +401,14 @@ async function main() {
     // 1. Fetch data
     console.log('Fetching latest optimization data...');
     const data = await fetchJson(`${SERVER_URL}/api/optimization-data/latest`);
-    console.log(`Loaded ${data.projectTasks.length} tasks\n`);
+    console.log(`Loaded ${data.projectTasks.length} tasks`);
+
+    // Start date: today + offset (0 for daily runs, 3+ for deep runs where leads need prep time).
+    const startDate = new Date();
+    startDate.setDate(startDate.getDate() + START_OFFSET_DAYS);
+    const startDateStr = `${startDate.getFullYear()}-${String(startDate.getMonth() + 1).padStart(2, '0')}-${String(startDate.getDate()).padStart(2, '0')}`;
+    data.params.startDate = startDateStr;
+    console.log(`Start date: ${startDateStr}${START_OFFSET_DAYS > 0 ? ` (+${START_OFFSET_DAYS} days offset for lead prep)` : ' (today)'}\n`);
 
     // 2. Baseline: default weights, fixed horizon, run DB-filter once to get a
     // reusable task set for subsequent iterations.
@@ -535,7 +554,69 @@ async function main() {
             categories: h.categories,
         }));
 
-    console.log(`Sending report email (including top ${topRuns.length} runs)...`);
+    // --- Build email attachments ---
+    const attachments = [];
+
+    // 1. Comparison CSV — one row per store per feasible run, for spreadsheet analysis.
+    const feasibleRuns = history.filter(h => h.feasible && h.iteration > 0 && h.storeBreakdown?.length > 0);
+    if (feasibleRuns.length > 0) {
+        const csvRows = ['Run,Score,Horizon,Parameters,Store,Types,Due Date,Finish Date,Variance Days,Early Days,NSO Status'];
+        for (const run of feasibleRuns) {
+            for (const s of run.storeBreakdown) {
+                csvRows.push([
+                    run.iteration, run.score, run.horizonMonths,
+                    `"${(run.paramChanges || '').replace(/"/g, '""')}"`,
+                    `"${(s.store || '').replace(/"/g, '""')}"`,
+                    `"${(s.projectTypes || []).join(', ')}"`,
+                    s.dueDate || '', s.finishDate || '',
+                    s.latenessDays || 0, s.daysEarly || 0,
+                    s.nsoStatus || s.status || '',
+                ].join(','));
+            }
+        }
+        attachments.push({
+            filename: `schedule-comparison-${startDateStr}.csv`,
+            content: csvRows.join('\n'),
+        });
+        console.log(`  CSV attachment: ${feasibleRuns.length} feasible runs × ${feasibleRuns[0]?.storeBreakdown?.length || 0} stores`);
+    }
+
+    // 2. Config JSONs for top runs — the exact settings needed to reproduce each candidate.
+    for (const run of topRuns.slice(0, 5)) {
+        attachments.push({
+            filename: `config-run-${run.iteration}-score-${run.score}.json`,
+            content: JSON.stringify({
+                iteration: run.iteration,
+                score: run.score,
+                horizonMonths: run.horizonMonths,
+                priorityWeights: run.priorityWeights || {},
+                categories: run.categories || {},
+            }, null, 2),
+        });
+    }
+
+    // 3. Task CSV — the DB-filtered task data with the adjusted start date, ready for
+    //    upload into the scheduler UI to reproduce any of these runs.
+    if (preparedTasks && preparedTasks.length > 0) {
+        const taskHeaders = Object.keys(preparedTasks[0]);
+        const taskCsvRows = [taskHeaders.join(',')];
+        for (const task of preparedTasks) {
+            taskCsvRows.push(taskHeaders.map(h => {
+                const val = task[h];
+                if (val == null) return '';
+                const str = String(val);
+                return str.includes(',') || str.includes('"') || str.includes('\n')
+                    ? `"${str.replace(/"/g, '""')}"` : str;
+            }).join(','));
+        }
+        attachments.push({
+            filename: `tasks-${startDateStr}.csv`,
+            content: taskCsvRows.join('\n'),
+        });
+        console.log(`  Task CSV attachment: ${preparedTasks.length} tasks`);
+    }
+
+    console.log(`Sending report email (${topRuns.length} top runs, ${attachments.length} attachments)...`);
     try {
         // Strip storeBreakdown from the full history to keep the email payload small —
         // topRuns already carries the breakdowns we care about.
@@ -552,6 +633,8 @@ async function main() {
                 strategistNotes: narrativeResult.text,
                 totalIterations: history.length,
                 durationMinutes: elapsed,
+                recipients: EMAIL_RECIPIENTS,
+                attachments,
             }),
         });
         console.log('Report sent:', reportResp.message || 'OK');

@@ -88,8 +88,8 @@ Array of `{ name, primaryTeam, secondaryTeam }`. These workers split time betwee
 **Why it matters:** Danny releases new schedules every 6-8 weeks. Simulating a full year on every iteration wastes compute — a 3-month horizon cuts per-iteration time ~3× and sharpens the score signal by only grading stores we'll actually ship soon.
 
 **Guidance:**
-- **Start at 3.** It's the default for this overnight run and produces the cleanest near-term signal.
-- **Only expand** (to 4, 5, ...) if the scores plateau and you have a specific reason to believe broader context would change the best parameter set (e.g., you suspect a 4-month-out NSO is pulling too much work forward and the 3mo view can't see it).
+- **Start at 3.** Produces the cleanest near-term signal and fastest iterations.
+- **Expand progressively.** By iteration 8-10, push to 4 months. By iteration 15, push to 5 months. This validates whether parameter improvements at shorter horizons hold when more stores come into view.
 - **Never go below 3.** Too short to meaningfully cover the planning horizon.
 - **Don't oscillate** — if you change horizon, commit to at least 2-3 iterations at the new value before switching back, so you can tell if the score change came from the horizon or the weights.
 

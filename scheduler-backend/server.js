@@ -2958,7 +2958,7 @@ function parseTasksCsv(csvText, config) {
  * Send the optimization report email. Called by the agent when optimization is complete.
  */
 app.post('/api/send-optimization-report', async (req, res) => {
-    const { baselineScore, bestScore, bestConfig, runHistory, topRuns, strategistNotes, totalIterations, durationMinutes, recipients } = req.body;
+    const { baselineScore, bestScore, bestConfig, runHistory, topRuns, strategistNotes, totalIterations, durationMinutes, recipients, attachments } = req.body;
 
     if (!baselineScore || !bestScore) {
         return res.status(400).json({ error: 'Missing required fields: baselineScore and bestScore.' });
@@ -2971,7 +2971,7 @@ app.post('/api/send-optimization-report', async (req, res) => {
 
     try {
         const results = await sendOptimizationReport(
-            { baselineScore, bestScore, bestConfig, runHistory, topRuns, strategistNotes, totalIterations, durationMinutes },
+            { baselineScore, bestScore, bestConfig, runHistory, topRuns, strategistNotes, totalIterations, durationMinutes, attachments },
             emailRecipients
         );
         res.json({ success: true, message: `Report sent to ${results.length} recipient group(s).`, results });
