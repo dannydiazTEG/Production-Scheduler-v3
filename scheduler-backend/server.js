@@ -22,6 +22,7 @@ const {
 } = require('./scheduling-engine');
 const { prepareProjectData } = require('./data-prep');
 const { createTimings } = require('./timings');
+const cache = require('./cache');
 
 // --- Setup ---
 const app = express();
@@ -208,8 +209,8 @@ async function loadMasterRoutingData() {
 // --- Data Preparation Logic (Postgres) ---
 // prepareProjectData is imported from data-prep.js
 // Wrapper to inject pgPool for backward compatibility with existing call sites
-async function prepareProjectDataLocal(projectTasks, updateProgress, timings) {
-    return prepareProjectData(projectTasks, updateProgress, pgPool, timings);
+async function prepareProjectDataLocal(projectTasks, updateProgress, timings, opts) {
+    return prepareProjectData(projectTasks, updateProgress, pgPool, timings, opts);
 }
 
 
@@ -2386,6 +2387,31 @@ app.get('/health', (req, res) => {
     });
 });
 
+// --- Cache admin ---
+app.get('/api/cache/stats', async (req, res) => {
+    try {
+        const out = await cache.stats(pgPool);
+        res.json(out);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+app.post('/api/cache/refresh', async (req, res) => {
+    const scope = (req.body && req.body.scope) || 'all';
+    const valid = new Set(['all', 'completed_ops', 'sku_prices', 'run_results']);
+    if (!valid.has(scope)) {
+        return res.status(400).json({ error: `invalid scope '${scope}'. Must be one of: ${[...valid].join(', ')}` });
+    }
+    try {
+        const result = await cache.invalidate(pgPool, scope);
+        const gcResult = await cache.gc(pgPool);
+        res.json({ ...result, gcRemoved: gcResult.removed });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // --- Diagnostics: per-phase timings for the most recent runs ---
 // Returns the last N finished schedule/optimize-run invocations with their
 // timing reports. Read-only. No auth — same posture as /health. Used to
@@ -2443,6 +2469,9 @@ app.post('/api/schedule', async (req, res) => {
         return res.status(400).json({ error: jobs[jobId].error });
     }
 
+    // ?fresh=1 bypasses both the completed-ops cache AND the full result cache.
+    const forceFresh = req.query.fresh === '1' || req.query.fresh === 'true';
+
     res.status(202).json({ jobId });
 
     (async () => {
@@ -2458,10 +2487,39 @@ app.post('/api/schedule', async (req, res) => {
             jobs[jobId].status = 'running';
             const timings = createTimings();
 
+            // --- Result cache lookup ---
+            const inputHashBody = {
+                projectTasks, params, teamDefs, ptoEntries, teamMemberChanges,
+                workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
+                startDateOverrides, endDateOverrides,
+            };
+            const inputHash = cache.computeInputHash(inputHashBody);
+            if (!forceFresh) {
+                timings.mark('cache.resultLookup.start');
+                const cachedRun = await cache.findRunResult(pgPool, inputHash, { timings });
+                timings.mark('cache.resultLookup.end');
+                if (cachedRun && cachedRun.result) {
+                    timings.note('resultCacheHit', true);
+                    const payload = { ...cachedRun.result, fromCache: true, cachedAt: cachedRun.createdAt, timings: timings.report() };
+                    jobs[jobId].status = 'complete';
+                    jobs[jobId].progress = 100;
+                    jobs[jobId].message = `Scheduling complete (served from cache, age ${Math.round((Date.now() - new Date(cachedRun.createdAt).getTime()) / 1000)}s).`;
+                    jobs[jobId].step = 'done';
+                    jobs[jobId].result = payload;
+                    recordDiagnostics({
+                        jobId, type: 'schedule', finishedAt: new Date().toISOString(),
+                        cacheHit: true, inputHash, timings: timings.report(),
+                    });
+                    console.log(`[Job ${jobId}] Served from result cache (hash ${inputHash.slice(0, 12)}).`);
+                    return;
+                }
+                timings.note('resultCacheHit', false);
+            }
+
             updateProgress(0, 'Preparing project data...', 'preparing');
 
             const { tasks: preparedTasks, logs: prepLogs, completedTasks } =
-                await prepareProjectDataLocal(projectTasks, updateProgress, timings);
+                await prepareProjectDataLocal(projectTasks, updateProgress, timings, { fresh: forceFresh });
 
             if (preparedTasks.length === 0) {
                 const combinedLogs = [...prepLogs, "All tasks for the submitted projects are already complete."];
@@ -2525,6 +2583,9 @@ app.post('/api/schedule', async (req, res) => {
             jobs[jobId].step = 'done';
             jobs[jobId].result = resultPayload;
 
+            // Write-back to result cache (fire-and-forget).
+            cache.saveRunResult(pgPool, inputHash, resultPayload, { runType: 'schedule' }).catch(() => {});
+
             recordDiagnostics({
                 jobId,
                 type: 'schedule',
@@ -2532,6 +2593,8 @@ app.post('/api/schedule', async (req, res) => {
                 inputTaskCount: projectTasks.length,
                 preparedTaskCount: preparedTasks.length,
                 responseBytes: serializedBytes,
+                inputHash,
+                cacheHit: false,
                 timings: timings.report(),
             });
 
@@ -2631,6 +2694,8 @@ app.post('/api/optimize-run', async (req, res) => {
         return res.status(400).json({ error: jobs[jobId].error });
     }
 
+    const forceFresh = req.query.fresh === '1' || req.query.fresh === 'true';
+
     res.status(202).json({ jobId });
 
     (async () => {
@@ -2646,6 +2711,38 @@ app.post('/api/optimize-run', async (req, res) => {
             jobs[jobId].status = 'running';
             const timings = createTimings();
 
+            // --- Result cache: the big cron win. Same priorityWeights proposed
+            // twice → skip the whole engine + scoring pipeline.
+            const inputHashBody = {
+                __runType: 'optimize-run',
+                projectTasks, params, teamDefs, ptoEntries, teamMemberChanges,
+                workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
+                startDateOverrides, endDateOverrides,
+                priorityWeights, storeDueDatesCsv, skipDbFilter, horizonMonths,
+            };
+            const inputHash = cache.computeInputHash(inputHashBody);
+            if (!forceFresh) {
+                timings.mark('cache.resultLookup.start');
+                const cachedRun = await cache.findRunResult(pgPool, inputHash, { timings });
+                timings.mark('cache.resultLookup.end');
+                if (cachedRun && cachedRun.result) {
+                    timings.note('resultCacheHit', true);
+                    const payload = { ...cachedRun.result, fromCache: true, cachedAt: cachedRun.createdAt, timings: timings.report() };
+                    jobs[jobId].status = 'complete';
+                    jobs[jobId].progress = 100;
+                    jobs[jobId].message = `Score: ${cachedRun.score}/100 (cached, age ${Math.round((Date.now() - new Date(cachedRun.createdAt).getTime()) / 1000)}s).`;
+                    jobs[jobId].step = 'done';
+                    jobs[jobId].result = payload;
+                    recordDiagnostics({
+                        jobId, type: 'optimize-run', finishedAt: new Date().toISOString(),
+                        cacheHit: true, inputHash, score: cachedRun.score, timings: timings.report(),
+                    });
+                    console.log(`[Job ${jobId}] Optimize-run served from cache (hash ${inputHash.slice(0, 12)}, score ${cachedRun.score}).`);
+                    return;
+                }
+                timings.note('resultCacheHit', false);
+            }
+
             // Prepare tasks (DB filter for completed ops, unless skipped)
             let preparedTasks;
             if (skipDbFilter) {
@@ -2654,7 +2751,7 @@ app.post('/api/optimize-run', async (req, res) => {
                 updateProgress(10, 'Using pre-prepared tasks (DB filter skipped)...', 'preparing');
             } else {
                 updateProgress(0, 'Preparing project data...', 'preparing');
-                const { tasks } = await prepareProjectDataLocal(projectTasks, updateProgress, timings);
+                const { tasks } = await prepareProjectDataLocal(projectTasks, updateProgress, timings, { fresh: forceFresh });
                 preparedTasks = tasks;
             }
 
@@ -2730,20 +2827,29 @@ app.post('/api/optimize-run', async (req, res) => {
             updateProgress(90, 'Scoring result...', 'scoring');
             const storeDueDates = parseDatesCsv(storeDueDatesCsv);
 
-            // Fetch SKU prices from database for labor efficiency scoring
+            // Fetch SKU prices — cache-backed (1h TTL; prices change rarely).
             let priceMap = new Map();
             try {
                 if (pgPool) {
-                    timings.mark('dbSkuPrices.start');
-                    const priceResult = await pgPool.query('SELECT item_reference_name, price FROM raw_fulcrum_price_breaks');
-                    timings.mark('dbSkuPrices.end');
-                    for (const row of priceResult.rows) {
-                        if (row.item_reference_name && row.price != null) {
-                            priceMap.set(row.item_reference_name, parseFloat(row.price) || 0);
+                    const cached = await cache.getSkuPrices(pgPool, { timings });
+                    if (cached) {
+                        priceMap = cached.priceMap;
+                        timings.note('skuPricesCacheHit', true);
+                        console.log(`[Job ${jobId}] Loaded ${priceMap.size} SKU prices from cache.`);
+                    } else {
+                        timings.mark('dbSkuPrices.start');
+                        const priceResult = await pgPool.query('SELECT item_reference_name, price FROM raw_fulcrum_price_breaks');
+                        timings.mark('dbSkuPrices.end');
+                        for (const row of priceResult.rows) {
+                            if (row.item_reference_name && row.price != null) {
+                                priceMap.set(row.item_reference_name, parseFloat(row.price) || 0);
+                            }
                         }
+                        timings.note('skuPriceRows', priceMap.size);
+                        timings.note('skuPricesCacheHit', false);
+                        console.log(`[Job ${jobId}] Loaded ${priceMap.size} SKU prices from DB.`);
+                        cache.setSkuPrices(pgPool, priceMap).catch(() => {});
                     }
-                    timings.note('skuPriceRows', priceMap.size);
-                    console.log(`[Job ${jobId}] Loaded ${priceMap.size} SKU prices from price break table.`);
                 }
             } catch (priceErr) {
                 console.warn(`[Job ${jobId}] Could not load prices: ${priceErr.message}. Labor efficiency will use CSV values.`);
@@ -2795,6 +2901,12 @@ app.post('/api/optimize-run', async (req, res) => {
             jobs[jobId].step = 'done';
             jobs[jobId].result = optResultPayload;
 
+            // Write to result cache with score attached.
+            cache.saveRunResult(pgPool, inputHash, optResultPayload, {
+                runType: 'optimize-run',
+                score: scoreData.compositeScore,
+            }).catch(() => {});
+
             recordDiagnostics({
                 jobId,
                 type: 'optimize-run',
@@ -2803,6 +2915,8 @@ app.post('/api/optimize-run', async (req, res) => {
                 preparedTaskCount: preparedTasks.length,
                 responseBytes: optSerializedBytes,
                 score: scoreData.compositeScore,
+                inputHash,
+                cacheHit: false,
                 timings: timings.report(),
             });
 
