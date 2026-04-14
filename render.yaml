@@ -24,13 +24,17 @@ services:
         value: production
       # All tuning knobs below are set via the Render dashboard so changes take
       # effect on the next trigger without needing a redeploy.
-      #   ANTHROPIC_API_KEY   — required (never commit the key)
-      #   OPTIMIZER_ITERATIONS — default 25
-      #   OPTIMIZER_HORIZON    — default 3 (months)
-      #   OPTIMIZER_RECIPIENTS — comma-separated emails; default Danny only
+      #
+      #   ANTHROPIC_API_KEY          — required (never commit the key)
+      #   OPTIMIZER_ITERATIONS       — default 25; set to 100+ for deep runs
+      #   OPTIMIZER_HORIZON          — default 3 (months)
+      #   OPTIMIZER_START_OFFSET_DAYS — default 0 (today); set to 3 for deep runs (lead prep time)
+      #   OPTIMIZER_RECIPIENTS       — comma-separated emails; default Danny only
       - key: ANTHROPIC_API_KEY
         sync: false
       - key: OPTIMIZER_ITERATIONS
+        sync: false
+      - key: OPTIMIZER_START_OFFSET_DAYS
         sync: false
       - key: OPTIMIZER_RECIPIENTS
         sync: false
