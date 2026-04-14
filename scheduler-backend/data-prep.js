@@ -5,6 +5,7 @@
  */
 
 const { formatDate } = require('./scheduling-engine');
+const { NOOP_TIMINGS } = require('./timings');
 
 /**
  * Query Postgres for completed and in-progress operations, then filter the task list.
@@ -12,13 +13,18 @@ const { formatDate } = require('./scheduling-engine');
  * @param {Array} projectTasks - Raw task objects with Project, SKU, Operation fields
  * @param {Function} updateProgress - Callback: (progress, message) => void
  * @param {Object} pgPool - Postgres connection pool (from db.js)
+ * @param {Object} [timings] - Optional timings instance from timings.js
  * @returns {{ tasks: Array, logs: string[], completedTasks: Array }}
  */
-async function prepareProjectData(projectTasks, updateProgress, pgPool) {
+async function prepareProjectData(projectTasks, updateProgress, pgPool, timings = NOOP_TIMINGS) {
+    timings.mark('dataPrep.total.start');
     const logs = [];
     const projectNames = [...new Set(projectTasks.map(p => p['Project']))];
+    timings.note('projectCount', projectNames.length);
+    timings.note('rawTaskCount', projectTasks.length);
 
     if (projectNames.length === 0) {
+        timings.mark('dataPrep.total.end');
         return { tasks: [], logs: ["No projects were provided to prepare."], completedTasks: [] };
     }
 
@@ -38,8 +44,11 @@ async function prepareProjectData(projectTasks, updateProgress, pgPool) {
             AND job_name = ANY($1)
         `;
 
+        timings.mark('dataPrep.dbCompletedOps.start');
         const result = await pgPool.query(query, [projectNames]);
+        timings.mark('dataPrep.dbCompletedOps.end');
         liveCompletedTasks = result.rows;
+        timings.note('dbCompletedOpsRows', liveCompletedTasks.length);
 
         logs.push(`Found ${liveCompletedTasks.length} completed operations in database.`);
         updateProgress(10, 'Processing completed task results...');
@@ -90,10 +99,13 @@ async function prepareProjectData(projectTasks, updateProgress, pgPool) {
                 WHERE rn = 1
                 AND log_type IN ('OperationLaborStarted', 'OperationLaborStopped')
             `;
+            timings.mark('dataPrep.dbInProgress.start');
             const ipResult = await pgPool.query(ipQuery, [projectNames]);
+            timings.mark('dataPrep.dbInProgress.end');
             ipResult.rows.forEach(row => {
                 inProgressOps.add(`${row.job_name}|${row.item_reference_name}|${row.operation_name}`);
             });
+            timings.note('dbInProgressRows', inProgressOps.size);
             logs.push(`Found ${inProgressOps.size} in-progress operations (Running/Paused in Fulcrum).`);
         }
     } catch (err) {
@@ -106,6 +118,8 @@ async function prepareProjectData(projectTasks, updateProgress, pgPool) {
         task.InProgress = inProgressOps.has(key);
     });
 
+    timings.note('filteredTaskCount', remainingTasks.length);
+    timings.mark('dataPrep.total.end');
     return { tasks: remainingTasks, logs, completedTasks: completedTasksForReport };
 }
 

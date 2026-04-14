@@ -21,6 +21,7 @@ const {
     TEAM_SORT_ORDER,
 } = require('./scheduling-engine');
 const { prepareProjectData } = require('./data-prep');
+const { createTimings } = require('./timings');
 
 // --- Setup ---
 const app = express();
@@ -73,6 +74,18 @@ app.use(express.urlencoded({ limit: '100mb', extended: true }));
 
 // --- In-memory store for async jobs ---
 const jobs = {};
+
+// --- Diagnostics ring buffer — last N completed runs' timing reports ---
+// Retained separately from `jobs` so they survive the 5-minute job cleanup and
+// can be inspected via /api/diagnostics/last-run after the fact.
+const DIAGNOSTICS_BUFFER_SIZE = 20;
+const lastDiagnostics = []; // newest first
+function recordDiagnostics(entry) {
+    lastDiagnostics.unshift(entry);
+    if (lastDiagnostics.length > DIAGNOSTICS_BUFFER_SIZE) {
+        lastDiagnostics.length = DIAGNOSTICS_BUFFER_SIZE;
+    }
+}
 
 // --- JOB CLEANUP TO PREVENT MEMORY LEAKS ---
 const JOB_RETENTION_MS = 5 * 60 * 1000;       // 5 minutes (was 1 hour)
@@ -195,8 +208,8 @@ async function loadMasterRoutingData() {
 // --- Data Preparation Logic (Postgres) ---
 // prepareProjectData is imported from data-prep.js
 // Wrapper to inject pgPool for backward compatibility with existing call sites
-async function prepareProjectDataLocal(projectTasks, updateProgress) {
-    return prepareProjectData(projectTasks, updateProgress, pgPool);
+async function prepareProjectDataLocal(projectTasks, updateProgress, timings) {
+    return prepareProjectData(projectTasks, updateProgress, pgPool, timings);
 }
 
 
@@ -2373,6 +2386,23 @@ app.get('/health', (req, res) => {
     });
 });
 
+// --- Diagnostics: per-phase timings for the most recent runs ---
+// Returns the last N finished schedule/optimize-run invocations with their
+// timing reports. Read-only. No auth — same posture as /health. Used to
+// answer "where is the scheduling engine spending its time in production?"
+app.get('/api/diagnostics/last-run', (req, res) => {
+    const limit = Math.max(1, Math.min(parseInt(req.query.limit, 10) || 1, DIAGNOSTICS_BUFFER_SIZE));
+    const type = req.query.type; // optional filter: 'schedule' or 'optimize-run'
+    const filtered = type
+        ? lastDiagnostics.filter(d => d.type === type)
+        : lastDiagnostics;
+    res.json({
+        count: filtered.length,
+        bufferSize: DIAGNOSTICS_BUFFER_SIZE,
+        runs: filtered.slice(0, limit),
+    });
+});
+
 // --- API Endpoints ---
 app.post('/api/schedule', async (req, res) => {
     console.log('Received request to /api/schedule to start a new job.');
@@ -2426,9 +2456,12 @@ app.post('/api/schedule', async (req, res) => {
             };
 
             jobs[jobId].status = 'running';
+            const timings = createTimings();
+
             updateProgress(0, 'Preparing project data...', 'preparing');
-            
-            const { tasks: preparedTasks, logs: prepLogs, completedTasks } = await prepareProjectDataLocal(projectTasks, updateProgress);
+
+            const { tasks: preparedTasks, logs: prepLogs, completedTasks } =
+                await prepareProjectDataLocal(projectTasks, updateProgress, timings);
 
             if (preparedTasks.length === 0) {
                 const combinedLogs = [...prepLogs, "All tasks for the submitted projects are already complete."];
@@ -2440,20 +2473,26 @@ app.post('/api/schedule', async (req, res) => {
                 jobs[jobId].result = {
                     finalSchedule: [], projectSummary: [], teamUtilization: [], weeklyOutput: [],
                     dailyCompletions: [], teamWorkload: [], recommendations: [],
-                    projectedCompletion: null, logs: combinedLogs, completedTasks, projectCompletionTimeline, error: ''
+                    projectedCompletion: null, logs: combinedLogs, completedTasks, projectCompletionTimeline, error: '',
+                    timings: timings.report(),
                 };
+                recordDiagnostics({ jobId, type: 'schedule', shortCircuit: true, finishedAt: new Date().toISOString(), timings: timings.report() });
                 return;
             }
 
             updateProgress(15, 'Starting scheduling simulation...', 'simulating');
-            
+
+            timings.mark('engineCall.start');
             const results = await runSchedulingEngine(
                 preparedTasks, params, teamDefs, ptoEntries, teamMemberChanges,
                 workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
                 startDateOverrides, endDateOverrides,
-                updateProgress
+                updateProgress,
+                undefined,
+                timings
             );
-            
+            timings.mark('engineCall.end');
+
             const combinedLogs = [...prepLogs, ...(results.logs || [])];
 
             // Trim logs to prevent bloated result payloads
@@ -2467,13 +2506,34 @@ app.post('/api/schedule', async (req, res) => {
 
             // Strip recommendations (unused by frontend) to reduce payload size
             const { recommendations, ...trimmedResults } = results;
+            timings.mark('completionTimeline.start');
             const projectCompletionTimeline = computeCompletionTimeline(projectTasks, completedTasks, results.completedOperations, params.startDate, teamDefs.mapping, params.teamsToIgnore);
+            timings.mark('completionTimeline.end');
+
+            // Measure JSON serialization cost — this is what the client actually waits on.
+            timings.mark('serialize.start');
+            const resultPayload = { ...trimmedResults, logs: trimmedLogs, completedTasks, projectCompletionTimeline };
+            const serializedBytes = Buffer.byteLength(JSON.stringify(resultPayload), 'utf8');
+            timings.mark('serialize.end');
+            timings.note('responseBytes', serializedBytes);
+
+            resultPayload.timings = timings.report();
 
             jobs[jobId].status = 'complete';
             jobs[jobId].progress = 100;
             jobs[jobId].message = 'Scheduling complete!';
             jobs[jobId].step = 'done';
-            jobs[jobId].result = { ...trimmedResults, logs: trimmedLogs, completedTasks, projectCompletionTimeline };
+            jobs[jobId].result = resultPayload;
+
+            recordDiagnostics({
+                jobId,
+                type: 'schedule',
+                finishedAt: new Date().toISOString(),
+                inputTaskCount: projectTasks.length,
+                preparedTaskCount: preparedTasks.length,
+                responseBytes: serializedBytes,
+                timings: timings.report(),
+            });
 
         } catch (e) {
             console.error(`[Job ${jobId}] Failed to run scheduling engine:`, e);
@@ -2584,15 +2644,17 @@ app.post('/api/optimize-run', async (req, res) => {
             };
 
             jobs[jobId].status = 'running';
+            const timings = createTimings();
 
             // Prepare tasks (DB filter for completed ops, unless skipped)
             let preparedTasks;
             if (skipDbFilter) {
                 preparedTasks = projectTasks;
+                timings.note('skipDbFilter', true);
                 updateProgress(10, 'Using pre-prepared tasks (DB filter skipped)...', 'preparing');
             } else {
                 updateProgress(0, 'Preparing project data...', 'preparing');
-                const { tasks } = await prepareProjectDataLocal(projectTasks, updateProgress);
+                const { tasks } = await prepareProjectDataLocal(projectTasks, updateProgress, timings);
                 preparedTasks = tasks;
             }
 
@@ -2631,6 +2693,7 @@ app.post('/api/optimize-run', async (req, res) => {
 
             updateProgress(15, 'Running scheduling engine...', 'simulating');
 
+            timings.mark('engineCall.start');
             const engineResult = await runSchedulingEngine(
                 preparedTasks, params, teamDefs,
                 ptoEntries || [], teamMemberChanges || [],
@@ -2638,8 +2701,10 @@ app.post('/api/optimize-run', async (req, res) => {
                 efficiencyData || {}, teamMemberNameMap || {},
                 startDateOverrides || {}, endDateOverrides || {},
                 updateProgress,
-                priorityWeights || undefined
+                priorityWeights || undefined,
+                timings
             );
+            timings.mark('engineCall.end');
 
             if (engineResult.error) {
                 jobs[jobId].status = 'complete';
@@ -2669,32 +2734,34 @@ app.post('/api/optimize-run', async (req, res) => {
             let priceMap = new Map();
             try {
                 if (pgPool) {
+                    timings.mark('dbSkuPrices.start');
                     const priceResult = await pgPool.query('SELECT item_reference_name, price FROM raw_fulcrum_price_breaks');
+                    timings.mark('dbSkuPrices.end');
                     for (const row of priceResult.rows) {
                         if (row.item_reference_name && row.price != null) {
                             priceMap.set(row.item_reference_name, parseFloat(row.price) || 0);
                         }
                     }
+                    timings.note('skuPriceRows', priceMap.size);
                     console.log(`[Job ${jobId}] Loaded ${priceMap.size} SKU prices from price break table.`);
                 }
             } catch (priceErr) {
                 console.warn(`[Job ${jobId}] Could not load prices: ${priceErr.message}. Labor efficiency will use CSV values.`);
             }
 
+            timings.mark('scoring.start');
             const scoreData = scoreResult(engineResult, storeDueDates, {
                 standardHoursPerDay: parseFloat(params.hoursPerDay) || 8,
                 priceMap,
                 inHorizonStores: inHorizonStoreSet,
                 horizonMonths: horizonMonths != null ? Number(horizonMonths) : null,
             });
+            timings.mark('scoring.end');
             const projectTypeMap = extractProjectTypeMap(engineResult.finalSchedule || []);
             const trimmed = trimEngineResult(engineResult);
 
-            jobs[jobId].status = 'complete';
-            jobs[jobId].progress = 100;
-            jobs[jobId].message = `Score: ${scoreData.compositeScore}/100 (${scoreData.grade}) | Feasible: ${scoreData.feasible} | Lateness: ${scoreData.totalLateness}d`;
-            jobs[jobId].step = 'done';
-            jobs[jobId].result = {
+            timings.mark('serialize.start');
+            const optResultPayload = {
                 score: scoreData,
                 projectSummary: trimmed.projectSummary,
                 teamUtilization: trimmed.teamUtilization,
@@ -2716,6 +2783,28 @@ app.post('/api/optimize-run', async (req, res) => {
                 preparedTasks: (req.body.returnPreparedTasks && !skipDbFilter) ? preparedTasks : undefined,
                 logs: (trimmed.logs || []).slice(-30)
             };
+            const optSerializedBytes = Buffer.byteLength(JSON.stringify(optResultPayload), 'utf8');
+            timings.mark('serialize.end');
+            timings.note('responseBytes', optSerializedBytes);
+
+            optResultPayload.timings = timings.report();
+
+            jobs[jobId].status = 'complete';
+            jobs[jobId].progress = 100;
+            jobs[jobId].message = `Score: ${scoreData.compositeScore}/100 (${scoreData.grade}) | Feasible: ${scoreData.feasible} | Lateness: ${scoreData.totalLateness}d`;
+            jobs[jobId].step = 'done';
+            jobs[jobId].result = optResultPayload;
+
+            recordDiagnostics({
+                jobId,
+                type: 'optimize-run',
+                finishedAt: new Date().toISOString(),
+                inputTaskCount: projectTasks.length,
+                preparedTaskCount: preparedTasks.length,
+                responseBytes: optSerializedBytes,
+                score: scoreData.compositeScore,
+                timings: timings.report(),
+            });
 
             console.log(`[Job ${jobId}] Optimize-run complete. Score: ${scoreData.compositeScore}/100 (${scoreData.grade}), Feasible: ${scoreData.feasible}`);
 

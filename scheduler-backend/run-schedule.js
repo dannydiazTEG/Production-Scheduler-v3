@@ -32,6 +32,7 @@ const {
     parseDate,
     formatDate,
 } = require('./scheduling-engine');
+const { createTimings } = require('./timings');
 
 // --- Argument Parsing ---
 function parseArgs() {
@@ -391,6 +392,7 @@ async function main() {
 
     // Run the engine
     if (!quiet) console.log('\nRunning scheduling engine...');
+    const timings = createTimings();
     const startTime = Date.now();
 
     const results = await runSchedulingEngine(
@@ -406,7 +408,8 @@ async function main() {
         startDateOverrides,
         endDateOverrides,
         updateProgress,
-        priorityWeights
+        priorityWeights,
+        timings
     );
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -419,6 +422,46 @@ async function main() {
     }
 
     printSummary(results);
+
+    if (!quiet) printTimings(results.timings || timings.report(), parseFloat(elapsed) * 1000);
+}
+
+function printTimings(report, totalWallMs) {
+    if (!report) return;
+    console.log('\n--- Per-phase Timings ---');
+    const spans = report.spans || {};
+    const spanEntries = Object.entries(spans).sort((a, b) => {
+        const sa = a[1].startedAt ?? Number.MAX_SAFE_INTEGER;
+        const sb = b[1].startedAt ?? Number.MAX_SAFE_INTEGER;
+        return sa - sb;
+    });
+    for (const [name, s] of spanEntries) {
+        if (s.open) {
+            console.log(`  ${name.padEnd(32)} <open>`);
+        } else {
+            console.log(`  ${name.padEnd(32)} ${s.ms.toFixed(1).padStart(8)} ms`);
+        }
+    }
+    console.log('\n--- Cumulative Hot-path Counters ---');
+    for (const [name, ms] of Object.entries(report.cumulativeMs || {})) {
+        console.log(`  ${name.padEnd(32)} ${(+ms).toFixed(1).padStart(8)} ms`);
+    }
+    const counters = report.counters || {};
+    if (Object.keys(counters).length) {
+        console.log('\n--- Counts ---');
+        for (const [name, c] of Object.entries(counters)) {
+            console.log(`  ${name.padEnd(32)} ${c.toLocaleString().padStart(12)}`);
+        }
+    }
+    if (report.notes && report.notes.length) {
+        console.log('\n--- Notes ---');
+        for (const n of report.notes) console.log(`  ${n.key}: ${n.value}`);
+    }
+    const engineTotal = spans['engine.total']?.ms || 0;
+    if (totalWallMs && engineTotal) {
+        const pct = (engineTotal / totalWallMs) * 100;
+        console.log(`\nengine.total / wall-clock: ${pct.toFixed(1)}%`);
+    }
 }
 
 main().catch(err => {
