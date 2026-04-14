@@ -71,7 +71,39 @@ You are running inside a headless cron job. Each iteration you will be shown the
 - Omit priorityWeights fields you don't want to change — they'll fall back to their defaults.
 - \`horizonMonths\` controls how far into the future the engine simulates. We are starting at ${DEFAULT_HORIZON_MONTHS} months to get faster iterations and a cleaner signal from near-term stores. Only expand (4, 5, 6...) if scores plateau with clear headroom and you believe broader context would change the answer.
 - Keep \`reasoning\` to 2-4 sentences: what you changed and why.
-- If the last run was infeasible (NSO/Infill violations), prioritize fixing that — higher NSO multiplier, higher pastDueBase, or raise dueDateNumerator.`,
+- If the last run was infeasible (NSO/Infill violations), prioritize fixing that — higher NSO multiplier, higher pastDueBase, or raise dueDateNumerator.
+
+## Escalation: Capacity Levers
+
+Priority weights alone cannot fix physical capacity shortages. Use this escalation ladder:
+
+## Escalation Ladder
+
+**Phase 1 — Priority weights (iterations 1-8):** Tune projectTypeMultipliers, dueDateNumerator, pastDue settings, assembly boost, dwell. This is free — no staffing or cost impact.
+
+**Phase 2 — Flex workers (iteration 8+):** Move existing team members between teams. Immediate effect, zero hiring cost. Only use proven flex routes:
+- Paint ↔ Scenic (bidirectional, common)
+- Carpentry ↔ Assembly (bidirectional, common)
+- Tech → Metal (one-way, rare/isolated)
+- CNC, Receiving, QC: NO flex (too specialized)
+- Max 20% of the source team's headcount can flex out (rounded down)
+- Only flex FROM a team with utilization headroom TO a team that's overloaded
+
+**Phase 3 — OT adjustments (iteration 10+):** Modify or remove existing overtime windows, or add new ones.
+- Check existing OT windows first — can you shorten/remove any? Removing OT is a WIN worth surfacing.
+- Max 9-10 hour days
+- Max 1-2 months per continuous window
+- 1 month cooldown required between OT windows for the same team (no back-to-back burnout)
+- No overlapping windows for the same team
+
+**Phase 4 — Headcount additions (iteration 15+):** Simulate hiring. Last resort.
+- Max +3 people above current count per team
+- New hires cannot start until 4 weeks after the schedule start date (hiring timeline)
+- Use teamMemberChanges with a future start date, not instant headcount bumps
+
+**Phase 5 — Schedule params:** productivityAssumption (0.70-0.95), globalBuffer (0-15%), maxIdleDays (1-30). Adjust one at a time.
+
+Always explain which phase you're in and why in your reasoning. If you find a schedule that works WITHOUT overtime, call that out explicitly — that's a major win.`,
 ].join('\n\n---\n\n');
 
 // --- Tool schema ---
@@ -109,6 +141,55 @@ const PROPOSE_TOOL = {
                 description: 'Months of store due dates to include. Start at 3; only expand if scores plateau.',
                 minimum: 3,
                 maximum: 12,
+            },
+            flexWorkers: {
+                type: 'array',
+                description: 'Move existing team members between teams (Phase 2). Immediate effect, no hiring cost. ONLY allowed routes: Paint↔Scenic, Carpentry↔Assembly, Tech→Metal. Max 20% of source team can flex out. Each entry reduces fromTeam by 1 and adds a hybrid worker.',
+                items: {
+                    type: 'object',
+                    properties: {
+                        fromTeam: { type: 'string', description: 'Source team losing a member.' },
+                        toTeam: { type: 'string', description: 'Destination team gaining flex capacity.' },
+                    },
+                    required: ['fromTeam', 'toTeam'],
+                },
+            },
+            overtimeChanges: {
+                type: 'array',
+                description: 'Modify, add, or remove OT windows (Phase 3). You will see existing OT windows in the run history context. Actions: "add" a new window, "remove" an existing one by team+dates, or "modify" to change hours/dates. Max 9-10hr, max 1-2 months continuous, 1 month cooldown between windows for same team. Removing OT is a WIN.',
+                items: {
+                    type: 'object',
+                    properties: {
+                        action: { type: 'string', enum: ['add', 'remove', 'modify'], description: '"add" new window, "remove" existing, "modify" existing.' },
+                        team: { type: 'string', description: 'Team name (exact match).' },
+                        hours: { type: 'number', minimum: 8, maximum: 10, description: 'Hours per day. 8 = remove OT (normal hours). 9-10 = overtime.' },
+                        startDate: { type: 'string', description: 'Start date (YYYY-MM-DD).' },
+                        endDate: { type: 'string', description: 'End date (YYYY-MM-DD). Max ~2 months from startDate.' },
+                    },
+                    required: ['action', 'team'],
+                },
+            },
+            newHires: {
+                type: 'array',
+                description: 'Simulate hiring (Phase 4, last resort). New person joins a team on a future date. Cannot start until 4 weeks after schedule start date. Max +3 people above current count per team.',
+                items: {
+                    type: 'object',
+                    properties: {
+                        team: { type: 'string', description: 'Team to add headcount to.' },
+                        count: { type: 'number', minimum: 0.5, maximum: 3, description: 'How many to add (can be fractional).' },
+                        startDate: { type: 'string', description: 'Earliest start date (YYYY-MM-DD). Must be ≥4 weeks after schedule start.' },
+                    },
+                    required: ['team', 'count', 'startDate'],
+                },
+            },
+            scheduleParams: {
+                type: 'object',
+                description: 'Override schedule-level parameters (Phase 5). Only change one at a time.',
+                properties: {
+                    productivityAssumption: { type: 'number', minimum: 0.70, maximum: 0.95, description: 'Fraction of hours actually productive.' },
+                    globalBuffer: { type: 'number', minimum: 0, maximum: 15, description: 'Buffer percentage added to all task estimates.' },
+                    maxIdleDays: { type: 'integer', minimum: 1, maximum: 30, description: 'Max days idle before dwell boost.' },
+                },
             },
             reasoning: {
                 type: 'string',
@@ -186,6 +267,117 @@ async function waitForJobToFinish(jobId) {
     throw new Error(`Gave up waiting for job ${jobId.slice(0, 8)}...`);
 }
 
+// --- Capacity change validation ---
+// Enforces real-world constraints so the LLM can't propose impossible staffing.
+
+const FLEX_ROUTES = [
+    { from: 'Paint', to: 'Scenic' },
+    { from: 'Scenic', to: 'Paint' },
+    { from: 'Carpentry', to: 'Assembly' },
+    { from: 'Assembly', to: 'Carpentry' },
+    { from: 'Tech', to: 'Metal' },  // one-way, isolated
+];
+const FLEX_ROUTE_SET = new Set(FLEX_ROUTES.map(r => `${r.from}→${r.to}`));
+const NO_FLEX_TEAMS = new Set(['CNC', 'Receiving', 'QC']);
+const FLEX_CAP_PCT = 0.20;
+const HIRE_DELAY_DAYS = 28;
+const MAX_HIRES_PER_TEAM = 3;
+const MAX_OT_WINDOW_DAYS = 62;  // ~2 months
+const OT_COOLDOWN_DAYS = 30;
+
+function validateAndCleanProposal(proposal, baseHeadcounts, existingOTWindows, scheduleStartDate) {
+    const warnings = [];
+
+    // --- Flex workers ---
+    if (proposal.flexWorkers?.length > 0) {
+        const hcMap = new Map(baseHeadcounts.map(h => [h.name, h.count]));
+        const flexCount = new Map(); // track how many we've flexed from each team
+
+        proposal.flexWorkers = proposal.flexWorkers.filter(fw => {
+            const routeKey = `${fw.fromTeam}→${fw.toTeam}`;
+            if (!FLEX_ROUTE_SET.has(routeKey)) {
+                warnings.push(`Blocked flex ${routeKey} — not an allowed route.`);
+                return false;
+            }
+            const currentHC = hcMap.get(fw.fromTeam) || 0;
+            const alreadyFlexed = flexCount.get(fw.fromTeam) || 0;
+            const maxFlex = Math.floor(currentHC * FLEX_CAP_PCT);
+            if (alreadyFlexed >= maxFlex) {
+                warnings.push(`Blocked flex from ${fw.fromTeam} — already at 20% cap (${alreadyFlexed}/${maxFlex}).`);
+                return false;
+            }
+            flexCount.set(fw.fromTeam, alreadyFlexed + 1);
+            return true;
+        });
+    }
+
+    // --- New hires ---
+    if (proposal.newHires?.length > 0) {
+        const earliest = new Date(scheduleStartDate);
+        earliest.setDate(earliest.getDate() + HIRE_DELAY_DAYS);
+        const earliestStr = earliest.toISOString().slice(0, 10);
+
+        proposal.newHires = proposal.newHires.filter(hire => {
+            if (hire.count > MAX_HIRES_PER_TEAM) {
+                hire.count = MAX_HIRES_PER_TEAM;
+                warnings.push(`Capped ${hire.team} hire to +${MAX_HIRES_PER_TEAM}.`);
+            }
+            if (hire.startDate < earliestStr) {
+                warnings.push(`Pushed ${hire.team} hire start from ${hire.startDate} to ${earliestStr} (4-week min).`);
+                hire.startDate = earliestStr;
+            }
+            return true;
+        });
+    }
+
+    // --- Overtime changes ---
+    if (proposal.overtimeChanges?.length > 0) {
+        proposal.overtimeChanges = proposal.overtimeChanges.filter(ot => {
+            if (ot.action === 'remove') return true; // always allow removal
+
+            // Check window duration
+            if (ot.startDate && ot.endDate) {
+                const start = new Date(ot.startDate);
+                const end = new Date(ot.endDate);
+                const durationDays = Math.round((end - start) / (24 * 60 * 60 * 1000));
+                if (durationDays > MAX_OT_WINDOW_DAYS) {
+                    const capped = new Date(start);
+                    capped.setDate(capped.getDate() + MAX_OT_WINDOW_DAYS);
+                    ot.endDate = capped.toISOString().slice(0, 10);
+                    warnings.push(`Capped ${ot.team} OT window to ${MAX_OT_WINDOW_DAYS} days (was ${durationDays}d).`);
+                }
+            }
+
+            // Check cooldown against existing windows for same team
+            if (ot.action === 'add' && ot.startDate) {
+                const teamWindows = existingOTWindows.filter(w => w.team === ot.team);
+                for (const existing of teamWindows) {
+                    const existEnd = new Date(existing.endDate);
+                    const newStart = new Date(ot.startDate);
+                    const gapDays = Math.round((newStart - existEnd) / (24 * 60 * 60 * 1000));
+                    if (gapDays >= 0 && gapDays < OT_COOLDOWN_DAYS) {
+                        warnings.push(`Blocked ${ot.team} OT starting ${ot.startDate} — only ${gapDays}d after existing window ends ${existing.endDate} (need ${OT_COOLDOWN_DAYS}d cooldown).`);
+                        return false;
+                    }
+                    // Check overlap
+                    const existStart = new Date(existing.startDate);
+                    const newEnd = new Date(ot.endDate || ot.startDate);
+                    if (newStart <= existEnd && newEnd >= existStart) {
+                        warnings.push(`Blocked overlapping ${ot.team} OT window (${ot.startDate}–${ot.endDate}) with existing (${existing.startDate}–${existing.endDate}).`);
+                        return false;
+                    }
+                }
+            }
+            return true;
+        });
+    }
+
+    if (warnings.length > 0) {
+        console.log(`  Validation: ${warnings.join(' | ')}`);
+    }
+    return proposal;
+}
+
 async function pollJob(jobId) {
     for (let i = 0; i < 60; i++) {
         await sleep(10000);
@@ -207,34 +399,115 @@ async function pollJob(jobId) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function runWithConfig(data, priorityWeights, horizonMonths, skipDbFilter = true, preparedTasks = null) {
+function runWithConfig(data, proposal, horizonMonths, skipDbFilter = true, preparedTasks = null) {
     // CRITICAL: when preparedTasks is provided (from the baseline's DB-filtered result),
     // use those as the projectTasks input and keep skipDbFilter=true. Otherwise the engine
     // would re-simulate already-completed work on every iteration, breaking feasibility.
+
+    // Start from the uploaded config, then layer on LLM-proposed changes.
+    const params = { ...data.params };
+    const teamDefs = JSON.parse(JSON.stringify(data.teamDefs)); // deep copy
+    let workHourOverrides = [...(data.workHourOverrides || [])];
+    let hybridWorkers = [...(data.hybridWorkers || [])];
+    let teamMemberChanges = [...(data.teamMemberChanges || [])];
+
+    // --- Phase 5: Schedule param overrides ---
+    if (proposal.scheduleParams) {
+        for (const [k, v] of Object.entries(proposal.scheduleParams)) {
+            if (v != null) params[k] = v;
+        }
+    }
+
+    // --- Phase 2: Flex workers ---
+    // Each flex entry: reduce fromTeam by 1, add a hybrid worker primary=fromTeam secondary=toTeam
+    if (proposal.flexWorkers?.length > 0) {
+        const hcMap = new Map((teamDefs.headcounts || []).map(h => [h.name, h]));
+        for (let i = 0; i < proposal.flexWorkers.length; i++) {
+            const fw = proposal.flexWorkers[i];
+            // Reduce source team headcount by 1
+            if (hcMap.has(fw.fromTeam)) {
+                hcMap.get(fw.fromTeam).count = Math.max(0.5, hcMap.get(fw.fromTeam).count - 1);
+            }
+            // Add hybrid worker
+            hybridWorkers.push({
+                name: `Flex-${fw.fromTeam}-${fw.toTeam}-${i + 1}`,
+                primaryTeam: fw.fromTeam,
+                secondaryTeam: fw.toTeam,
+            });
+        }
+        teamDefs.headcounts = Array.from(hcMap.values());
+    }
+
+    // --- Phase 3: Overtime changes (add/remove/modify) ---
+    if (proposal.overtimeChanges?.length > 0) {
+        for (const ot of proposal.overtimeChanges) {
+            if (ot.action === 'remove') {
+                // Remove windows matching team (and optionally dates)
+                workHourOverrides = workHourOverrides.filter(w => {
+                    if (w.team !== ot.team) return true;
+                    if (ot.startDate && w.startDate !== ot.startDate) return true;
+                    return false; // match — remove it
+                });
+            } else if (ot.action === 'modify') {
+                // Find and update the first matching window for this team
+                const idx = workHourOverrides.findIndex(w =>
+                    w.team === ot.team && (!ot.startDate || w.startDate === ot.startDate)
+                );
+                if (idx !== -1) {
+                    if (ot.hours != null) workHourOverrides[idx].hours = String(ot.hours);
+                    if (ot.endDate) workHourOverrides[idx].endDate = ot.endDate;
+                    if (ot.startDate && !workHourOverrides[idx].startDate) workHourOverrides[idx].startDate = ot.startDate;
+                }
+            } else if (ot.action === 'add') {
+                workHourOverrides.push({
+                    id: Date.now() + Math.random(),
+                    team: ot.team,
+                    hours: String(ot.hours),
+                    startDate: ot.startDate,
+                    endDate: ot.endDate,
+                });
+            }
+        }
+    }
+
+    // --- Phase 4: New hires (simulated as team member changes with future start date) ---
+    if (proposal.newHires?.length > 0) {
+        for (let i = 0; i < proposal.newHires.length; i++) {
+            const hire = proposal.newHires[i];
+            for (let j = 0; j < Math.ceil(hire.count); j++) {
+                teamMemberChanges.push({
+                    name: `NewHire-${hire.team}-${i + 1}-${j + 1}`,
+                    team: hire.team,
+                    date: hire.startDate,
+                    type: 'Starts',
+                });
+            }
+        }
+    }
+
     return submitRun({
         projectTasks: preparedTasks || data.projectTasks,
-        params: data.params,
-        teamDefs: data.teamDefs,
+        params,
+        teamDefs,
         ptoEntries: data.ptoEntries || [],
-        teamMemberChanges: data.teamMemberChanges || [],
-        workHourOverrides: data.workHourOverrides || [],
-        hybridWorkers: data.hybridWorkers || [],
+        teamMemberChanges,
+        workHourOverrides,
+        hybridWorkers,
         efficiencyData: data.efficiencyData || {},
         teamMemberNameMap: data.teamMemberNameMap || {},
         startDateOverrides: data.startDateOverrides || {},
         endDateOverrides: data.endDateOverrides || {},
         storeDueDatesCsv: data.storeDueDatesCsv,
         skipDbFilter,
-        // Ask server to echo the DB-filtered tasks back once, so we can reuse them.
         returnPreparedTasks: !skipDbFilter,
-        priorityWeights: priorityWeights || {},
+        priorityWeights: proposal.priorityWeights || {},
         horizonMonths,
     });
 }
 
 // --- LLM calls ---
 
-function buildHistoryMessage(history, bestScore, bestConfig, iteration) {
+function buildHistoryMessage(history, bestScore, bestConfig, iteration, currentOTWindows, currentHeadcounts) {
     const lines = [];
     lines.push(`## Run state`);
     lines.push(`Iteration ${iteration}/${MAX_ITERATIONS}.`);
@@ -250,14 +523,30 @@ function buildHistoryMessage(history, bestScore, bestConfig, iteration) {
             lines.push(`NSO violations: ${bestScore.nsoViolations.length} (${bestScore.nsoViolations.slice(0, 3).map(v => `${v.store} ${v.latenessDays}d late`).join('; ')})`);
         }
         if (bestScore.teamHealth?.peaks?.length > 0) {
-            const topPeak = bestScore.teamHealth.peaks[0];
-            lines.push(`Top workload peak: ${topPeak.team} @ ${topPeak.workloadRatio}% in ${topPeak.week}`);
+            lines.push(`Top workload peaks: ${bestScore.teamHealth.peaks.slice(0, 3).map(p => `${p.team} @ ${p.workloadRatio}% (${p.week})`).join(', ')}`);
         }
     }
     if (bestConfig?.priorityWeights && Object.keys(bestConfig.priorityWeights).length > 0) {
         lines.push(``);
         lines.push(`Best priorityWeights: \`${JSON.stringify(bestConfig.priorityWeights)}\``);
     }
+
+    // Show current team headcounts so the LLM knows what it's working with
+    if (currentHeadcounts?.length > 0) {
+        lines.push(``);
+        lines.push(`### Current headcounts`);
+        lines.push(currentHeadcounts.map(h => `${h.name}: ${h.count}`).join(' | '));
+    }
+
+    // Show existing OT windows so the LLM can modify/remove them intelligently
+    if (currentOTWindows?.length > 0) {
+        lines.push(``);
+        lines.push(`### Existing OT windows (from uploaded config)`);
+        for (const w of currentOTWindows) {
+            lines.push(`- ${w.team}: ${w.hours}h/day (${w.startDate} → ${w.endDate})`);
+        }
+    }
+
     lines.push(``);
     lines.push(`### History`);
     for (const h of history) {
@@ -270,8 +559,8 @@ function buildHistoryMessage(history, bestScore, bestConfig, iteration) {
     return lines.join('\n');
 }
 
-async function proposeNextRun(history, bestScore, bestConfig, iteration) {
-    const userMsg = buildHistoryMessage(history, bestScore, bestConfig, iteration);
+async function proposeNextRun(history, bestScore, bestConfig, iteration, currentOTWindows, currentHeadcounts) {
+    const userMsg = buildHistoryMessage(history, bestScore, bestConfig, iteration, currentOTWindows, currentHeadcounts);
     const maxAttempts = 2;
     let lastErr;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -345,8 +634,25 @@ function describeProposal(proposal) {
     const parts = [`h=${proposal.horizonMonths}mo`];
     const pw = proposal.priorityWeights || {};
     const flat = flattenWeights(pw);
-    if (Object.keys(flat).length === 0) parts.push('(no weight changes)');
-    else parts.push(Object.entries(flat).map(([k, v]) => `${k}=${v}`).join(', '));
+    if (Object.keys(flat).length > 0) parts.push(Object.entries(flat).map(([k, v]) => `${k}=${v}`).join(', '));
+    if (proposal.flexWorkers?.length > 0) {
+        parts.push('Flex: ' + proposal.flexWorkers.map(f => `${f.fromTeam}→${f.toTeam}`).join(', '));
+    }
+    if (proposal.overtimeChanges?.length > 0) {
+        parts.push('OT: ' + proposal.overtimeChanges.map(o => {
+            if (o.action === 'remove') return `remove ${o.team}`;
+            if (o.action === 'modify') return `mod ${o.team} ${o.hours || ''}h`;
+            return `add ${o.team} ${o.hours}h`;
+        }).join(', '));
+    }
+    if (proposal.newHires?.length > 0) {
+        parts.push('Hire: ' + proposal.newHires.map(h => `+${h.count} ${h.team} @${h.startDate}`).join(', '));
+    }
+    if (proposal.scheduleParams) {
+        const sp = Object.entries(proposal.scheduleParams).filter(([, v]) => v != null);
+        if (sp.length > 0) parts.push(sp.map(([k, v]) => `${k}=${v}`).join(', '));
+    }
+    if (parts.length === 1) parts.push('(no changes)');
     return parts.join(' | ');
 }
 
@@ -419,7 +725,7 @@ async function main() {
         console.log('  (dry-run: skipping baseline schedule run)');
         baseResult = { score: { compositeScore: 0, grade: 'N/A', feasible: true, categories: {}, horizonMonths: DEFAULT_HORIZON_MONTHS, storesInScope: 0 }, configUsed: { priorityWeights: {} } };
     } else {
-        baseResult = await runWithConfig(data, {}, DEFAULT_HORIZON_MONTHS, /* skipDbFilter */ false);
+        baseResult = await runWithConfig(data, { priorityWeights: {} }, DEFAULT_HORIZON_MONTHS, /* skipDbFilter */ false);
         logScore('Baseline', baseResult.score);
         preparedTasks = baseResult.preparedTasks || null;
         if (preparedTasks) {
@@ -447,11 +753,17 @@ async function main() {
 
         let proposal;
         let proposalUsage;
+        const currentOTWindows = data.workHourOverrides || [];
+        const currentHeadcounts = data.teamDefs?.headcounts || [];
         try {
-            const r = await proposeNextRun(history, bestScore, bestConfig, iter);
+            const r = await proposeNextRun(history, bestScore, bestConfig, iter, currentOTWindows, currentHeadcounts);
             proposal = r.proposal;
             proposalUsage = r.usage;
             addUsage(tokenAcc, proposalUsage);
+
+            // Validate and enforce real-world constraints before running
+            proposal = validateAndCleanProposal(proposal, currentHeadcounts, currentOTWindows, startDateStr);
+
             console.log(`  LLM proposal: ${describeProposal(proposal)}`);
             console.log(`  Reasoning: ${proposal.reasoning}`);
         } catch (e) {
@@ -478,7 +790,7 @@ async function main() {
         try {
             // Pass the baseline's DB-filtered task set so every iteration sees the
             // same ground truth as the baseline did.
-            const result = await runWithConfig(data, proposal.priorityWeights, proposal.horizonMonths, /* skipDbFilter */ true, preparedTasks);
+            const result = await runWithConfig(data, proposal, proposal.horizonMonths, /* skipDbFilter */ true, preparedTasks);
             const s = result.score;
             logScore(`Iter ${iter}`, s);
 
@@ -496,8 +808,10 @@ async function main() {
                 paramChanges: describeProposal(proposal),
                 reasoning: proposal.reasoning,
                 priorityWeights: proposal.priorityWeights || {},
-                // Keep the per-store breakdown so we can build a top-3 comparison
-                // table in the email report at the end of the run.
+                flexWorkers: proposal.flexWorkers || [],
+                overtimeChanges: proposal.overtimeChanges || [],
+                newHires: proposal.newHires || [],
+                scheduleParams: proposal.scheduleParams || null,
                 storeBreakdown: s.storeBreakdown || [],
                 categories: s.categories || null,
             });
@@ -550,6 +864,10 @@ async function main() {
             horizonMonths: h.horizonMonths,
             paramChanges: h.paramChanges,
             priorityWeights: h.priorityWeights,
+            flexWorkers: h.flexWorkers,
+            overtimeChanges: h.overtimeChanges,
+            newHires: h.newHires,
+            scheduleParams: h.scheduleParams,
             storeBreakdown: h.storeBreakdown,
             categories: h.categories,
         }));
@@ -582,6 +900,8 @@ async function main() {
     }
 
     // 2. Config JSONs for top runs — the exact settings needed to reproduce each candidate.
+    //    Includes priorityWeights, headcount changes, OT windows, and schedule params
+    //    so Danny can load any winner directly into the scheduler UI.
     for (const run of topRuns.slice(0, 5)) {
         attachments.push({
             filename: `config-run-${run.iteration}-score-${run.score}.json`,
@@ -590,6 +910,10 @@ async function main() {
                 score: run.score,
                 horizonMonths: run.horizonMonths,
                 priorityWeights: run.priorityWeights || {},
+                flexWorkers: run.flexWorkers || [],
+                overtimeChanges: run.overtimeChanges || [],
+                newHires: run.newHires || [],
+                scheduleParams: run.scheduleParams || null,
                 categories: run.categories || {},
             }, null, 2),
         });
