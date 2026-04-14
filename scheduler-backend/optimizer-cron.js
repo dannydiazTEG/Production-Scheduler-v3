@@ -101,7 +101,7 @@ Priority weights alone cannot fix physical capacity shortages. Use this escalati
 - New hires cannot start until 4 weeks after the schedule start date (hiring timeline)
 - Use teamMemberChanges with a future start date, not instant headcount bumps
 
-**Phase 5 — Schedule params:** productivityAssumption (0.70-0.95), globalBuffer (0-15%), maxIdleDays (1-30). Adjust one at a time.
+**Phase 5 — Schedule params:** globalBuffer (3-15%, prefer 5%+), maxIdleDays (1-30). DO NOT touch productivityAssumption — it is a fixed business decision (0.85 for schedules, 0.81 for external reporting). Adjust one param at a time.
 
 Always explain which phase you're in and why in your reasoning. If you find a schedule that works WITHOUT overtime, call that out explicitly — that's a major win.`,
 ].join('\n\n---\n\n');
@@ -182,12 +182,23 @@ const PROPOSE_TOOL = {
                     required: ['team', 'count', 'startDate'],
                 },
             },
+            taskDateOverrides: {
+                type: 'array',
+                description: 'Override task-level DueDate for all tasks belonging to a specific store. Use when a store has stale/incorrect task dates creating false urgency (e.g., tasks say 2/11 but real production due is 4/9). Changes ENGINE urgency calculations only — does NOT change store due dates used for SCORING. Use to test de-prioritizing past-due stores or pushing stores forward.',
+                items: {
+                    type: 'object',
+                    properties: {
+                        store: { type: 'string', description: 'Store name (matched case-insensitive against task.Store).' },
+                        dueDate: { type: 'string', description: 'New DueDate for all tasks in this store (YYYY-MM-DD).' },
+                    },
+                    required: ['store', 'dueDate'],
+                },
+            },
             scheduleParams: {
                 type: 'object',
-                description: 'Override schedule-level parameters (Phase 5). Only change one at a time.',
+                description: 'Override schedule-level parameters (Phase 5). Only change one at a time. DO NOT change productivityAssumption — it is a fixed business decision (0.85 for schedules, 0.81 for stakeholder reporting).',
                 properties: {
-                    productivityAssumption: { type: 'number', minimum: 0.70, maximum: 0.95, description: 'Fraction of hours actually productive.' },
-                    globalBuffer: { type: 'number', minimum: 0, maximum: 15, description: 'Buffer percentage added to all task estimates.' },
+                    globalBuffer: { type: 'number', minimum: 3, maximum: 15, description: 'Buffer percentage added to all task estimates. Default 6.5%, prefer 5%+. Floor is 3%.' },
                     maxIdleDays: { type: 'integer', minimum: 1, maximum: 30, description: 'Max days idle before dwell boost.' },
                 },
             },
@@ -384,6 +395,20 @@ function validateAndCleanProposal(proposal, baseHeadcounts, existingOTWindows, s
         });
     }
 
+    // --- Schedule params ---
+    if (proposal.scheduleParams) {
+        // productivityAssumption is a fixed business decision — never allow changes
+        if (proposal.scheduleParams.productivityAssumption != null) {
+            warnings.push(`Blocked productivityAssumption change (${proposal.scheduleParams.productivityAssumption}) — fixed at uploaded value.`);
+            delete proposal.scheduleParams.productivityAssumption;
+        }
+        // globalBuffer: floor at 3%, prefer 5%+
+        if (proposal.scheduleParams.globalBuffer != null && proposal.scheduleParams.globalBuffer < 3) {
+            warnings.push(`Clamped globalBuffer from ${proposal.scheduleParams.globalBuffer}% to 3% (floor).`);
+            proposal.scheduleParams.globalBuffer = 3;
+        }
+    }
+
     if (warnings.length > 0) {
         console.log(`  Validation: ${warnings.join(' | ')}`);
     }
@@ -497,8 +522,33 @@ function runWithConfig(data, proposal, horizonMonths, skipDbFilter = true, prepa
         }
     }
 
+    // --- Task date overrides ---
+    // Apply store-level DueDate overrides to individual task rows. This changes what
+    // the engine sees for urgency (pastDue, dueDateNumerator) without touching the
+    // store due dates CSV that scoring uses. Lets the LLM test "what if Fulton's tasks
+    // had a 4/9 deadline instead of 2/11" to see if de-prioritizing an already-past-due
+    // store unblocks others.
+    let tasks = preparedTasks || data.projectTasks;
+    if (proposal.taskDateOverrides?.length > 0) {
+        // Deep copy tasks so we don't mutate the shared preparedTasks array
+        tasks = tasks.map(t => ({ ...t }));
+        for (const override of proposal.taskDateOverrides) {
+            const storeLower = (override.store || '').toLowerCase().trim();
+            let count = 0;
+            for (const t of tasks) {
+                if ((t.Store || '').toLowerCase().trim() === storeLower) {
+                    t.DueDate = override.dueDate;
+                    count++;
+                }
+            }
+            if (count > 0) {
+                console.log(`  Task date override: ${override.store} → ${override.dueDate} (${count} tasks)`);
+            }
+        }
+    }
+
     return submitRun({
-        projectTasks: preparedTasks || data.projectTasks,
+        projectTasks: tasks,
         params,
         teamDefs,
         ptoEntries: data.ptoEntries || [],
@@ -659,6 +709,9 @@ function describeProposal(proposal) {
     }
     if (proposal.newHires?.length > 0) {
         parts.push('Hire: ' + proposal.newHires.map(h => `+${h.count} ${h.team} @${h.startDate}`).join(', '));
+    }
+    if (proposal.taskDateOverrides?.length > 0) {
+        parts.push('Dates: ' + proposal.taskDateOverrides.map(d => `${d.store}→${d.dueDate}`).join(', '));
     }
     if (proposal.scheduleParams) {
         const sp = Object.entries(proposal.scheduleParams).filter(([, v]) => v != null);
@@ -855,6 +908,7 @@ async function main() {
                 flexWorkers: proposal.flexWorkers || [],
                 overtimeChanges: proposal.overtimeChanges || [],
                 newHires: proposal.newHires || [],
+                taskDateOverrides: proposal.taskDateOverrides || [],
                 scheduleParams: proposal.scheduleParams || null,
                 storeBreakdown: s.storeBreakdown || [],
                 categories: s.categories || null,
@@ -921,6 +975,7 @@ async function main() {
             flexWorkers: h.flexWorkers,
             overtimeChanges: h.overtimeChanges,
             newHires: h.newHires,
+            taskDateOverrides: h.taskDateOverrides,
             scheduleParams: h.scheduleParams,
             storeBreakdown: h.storeBreakdown,
             categories: h.categories,
@@ -969,6 +1024,7 @@ async function main() {
                 flexWorkers: run.flexWorkers || [],
                 overtimeChanges: run.overtimeChanges || [],
                 newHires: run.newHires || [],
+                taskDateOverrides: run.taskDateOverrides || [],
                 scheduleParams: run.scheduleParams || null,
                 categories: run.categories || {},
             }, null, 2),
