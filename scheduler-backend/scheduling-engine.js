@@ -500,6 +500,9 @@ const runSchedulingEngine = async (
         let current_date = parseDate(params.startDate);
         let daily_log_entries = [], completed_operations = [], dailyPrioritySnapshots = [];
         const completedTaskIDs = new Set(); // O(1) lookup for assembly group gate checks
+        // O(1) lookup by TaskID — kept in sync with completed_operations.push()
+        // so isReady() predecessor checks avoid O(N) linear scans.
+        const completedByTaskId = new Map();
         logs.push(`Starting with ${unscheduled_tasks.length} schedulable tasks.`);
         let loopCounter = 0; const maxDays = 365 * 2;
         let dailyDwellingData = {};
@@ -515,6 +518,37 @@ const runSchedulingEngine = async (
         // so we can boost priority of tasks waiting too long after their predecessor finished
         const completionBySkuOrder = new Map(); // key: "Project|SKU|Order" -> Date
         const maxIdleDays = parseFloat(params.maxIdleDays) || weights.dwellThresholdDays;
+
+        // --- Phase 2 indexes ---
+        // Build once so hot-path callers get O(1) lookups instead of O(N) .find() scans.
+        const hybridByName = new Map(hybridWorkers.map(h => [h.name, h]));
+        const hybridsBySecondaryTeam = new Map();
+        for (const h of hybridWorkers) {
+            if (!h.secondaryTeam) continue;
+            if (!hybridsBySecondaryTeam.has(h.secondaryTeam)) hybridsBySecondaryTeam.set(h.secondaryTeam, []);
+            hybridsBySecondaryTeam.get(h.secondaryTeam).push(h);
+        }
+        const workHourOverridesByTeam = new Map();
+        for (const o of workHourOverrides) {
+            if (!workHourOverridesByTeam.has(o.team)) workHourOverridesByTeam.set(o.team, []);
+            workHourOverridesByTeam.get(o.team).push(o);
+        }
+        const findWorkHourOverride = (team, dateStr) => {
+            const list = workHourOverridesByTeam.get(team);
+            if (!list) return undefined;
+            for (const o of list) {
+                if (dateStr >= o.startDate && dateStr <= o.endDate) return o;
+            }
+            return undefined;
+        };
+
+        // Pre-compute project-type multiplier per task — value depends only on
+        // task.ProjectType, which is stable across the whole run. Reuses the
+        // existing `_projectTypeMultiplier` field so no new field appears in output.
+        unscheduled_tasks.forEach(t => {
+            t._projectTypeMultiplier =
+                PROJECT_TYPE_MULTIPLIERS[(t.ProjectType || '').toUpperCase()] || 1.0;
+        });
 
         timings.mark('engine.setup.end');
         timings.mark('engine.mainLoop.start');
@@ -574,7 +608,7 @@ const runSchedulingEngine = async (
 
                 const predecessorsReady = predecessors.every(p => {
                     timings.bump('isReady.completedOpsFind');
-                    const completedPredecessor = completed_operations.find(c => c.TaskID === p.TaskID);
+                    const completedPredecessor = completedByTaskId.get(p.TaskID);
                     if (!completedPredecessor) {
                         return false; // Predecessor isn't done yet
                     }
@@ -657,7 +691,8 @@ const runSchedulingEngine = async (
                 }
 
                 // Project Type multiplier: NSO > Infill > RENO > PC
-                const projectTypeMultiplier = PROJECT_TYPE_MULTIPLIERS[(task.ProjectType || '').toUpperCase()] || 1.0;
+                // Cached once at setup since ProjectType is stable across the run.
+                const projectTypeMultiplier = task._projectTypeMultiplier;
 
                 // Dwell time multiplier: boost priority when a task's predecessor completed
                 // but this task has been waiting too long to get picked up
@@ -686,7 +721,7 @@ const runSchedulingEngine = async (
                 task.DynamicPriority = (task.BasePriority * dueDateMultiplier * assemblyGroupMultiplier * projectTypeMultiplier * dwellMultiplier * inProgressMultiplier) / task.TeamCapacity;
                 task._dueDateMultiplier = dueDateMultiplier;
                 task._assemblyGroupMultiplier = assemblyGroupMultiplier;
-                task._projectTypeMultiplier = projectTypeMultiplier;
+                // _projectTypeMultiplier already set at setup — it's stable across the run.
                 task._dwellMultiplier = dwellMultiplier;
                 task._inProgressMultiplier = inProgressMultiplier;
             });
@@ -777,7 +812,7 @@ const runSchedulingEngine = async (
             Object.keys(dailyRoster).forEach(team => {
                 let hours = parseFloat(params.hoursPerDay);
                 timings.bump('workHourOverrides.find');
-                const override = workHourOverrides.find(o => o.team === team && currentDateStr >= o.startDate && currentDateStr <= o.endDate);
+                const override = findWorkHourOverride(team, currentDateStr);
 
                 // Check overtime constraints
                 const isOvertime = override && parseFloat(override.hours) > parseFloat(params.hoursPerDay);
@@ -900,8 +935,8 @@ const runSchedulingEngine = async (
                 if (ready_tasks.length > 0) {
                     for (const team_name in daily_capacity) {
                         const available_members = daily_capacity[team_name]?.filter(m => m.SchedulableHoursLeft > 0.01);
-                        const availableHybrids = hybridWorkers
-                            .filter(h => h.secondaryTeam === team_name)
+                        const hybridsForTeam = hybridsBySecondaryTeam.get(team_name) || [];
+                        const availableHybrids = hybridsForTeam
                             .map(h => daily_capacity[h.primaryTeam]?.find(m => m.TeamMember === h.name && m.SchedulableHoursLeft > 0.01))
                             .filter(Boolean);
                         const fullRoster = [...(available_members || []), ...availableHybrids];
@@ -909,7 +944,10 @@ const runSchedulingEngine = async (
                         if (fullRoster.length > 0) {
                             for (const member of fullRoster) {
                                 if (member.SchedulableHoursLeft <= 0.01) continue;
-                                const member_team = hybridWorkers.find(h => h.name === member.TeamMember)?.secondaryTeam === team_name ? team_name : hybridWorkers.find(h => h.name === member.TeamMember)?.primaryTeam || team_name;
+                                const memberHybrid = hybridByName.get(member.TeamMember);
+                                const member_team = memberHybrid?.secondaryTeam === team_name
+                                    ? team_name
+                                    : (memberHybrid?.primaryTeam || team_name);
                                 let task_to_assign = null;
                                 const team_ready_tasks = ready_tasks.filter(t => t.Team === member_team);
                                 const continuation_task = team_ready_tasks.find(t => t.AssignedTo === member.TeamMember);
@@ -920,12 +958,14 @@ const runSchedulingEngine = async (
                                     if (!new_task) new_task = team_ready_tasks.find(t => !t.AssignedTo);
                                     if (new_task) {
                                         task_to_assign = new_task;
-                                        unscheduled_tasks.find(t => t.TaskID === task_to_assign.TaskID).AssignedTo = member.TeamMember;
+                                        // new_task is the same object reference already in unscheduled_tasks;
+                                        // no need to re-find it.
+                                        task_to_assign.AssignedTo = member.TeamMember;
                                     }
                                 }
                                 if (task_to_assign) {
                                     const member_for_task = task_to_assign.AssignedTo || member.TeamMember;
-                                    const hybridInfo = hybridWorkers.find(h => h.name === member_for_task);
+                                    const hybridInfo = hybridByName.get(member_for_task);
                                     const capacityPool = hybridInfo ? daily_capacity[hybridInfo.primaryTeam] : daily_capacity[team_name];
                                     const memberInPool = capacityPool?.find(m => m.TeamMember === member_for_task);
                                     if (memberInPool && memberInPool.SchedulableHoursLeft > 0.01) {
@@ -937,14 +977,18 @@ const runSchedulingEngine = async (
                                             const teamHoursPerDay = dailyHoursMap[member_team] || params.hoursPerDay;
                                             daily_log_entries.push({ ...task_to_assign, Date: currentDateStr, 'Task Hours Completed': Number(task_hours_to_complete.toFixed(2)), 'Time Spent (Hours)': Number(time_to_spend_on_task.toFixed(2)), TeamMember: member_for_task, TeamMemberName: teamMemberNameMap[member_for_task] || member_for_task, 'Hours Per Day': teamHoursPerDay });
                                             skus_being_worked_on_today.add(task_to_assign.SKU);
-                                            const taskInArray = unscheduled_tasks.find(t => t.TaskID === task_to_assign.TaskID);
+                                            // task_to_assign is the same reference as the task in unscheduled_tasks
+                                            // (filter/find return original refs, not clones), so mutate directly.
+                                            const taskInArray = task_to_assign;
                                             taskInArray.HoursRemaining -= task_hours_to_complete;
                                             memberInPool.SchedulableHoursLeft -= time_to_spend_on_task;
-                                            
+
                                             totalHoursCompleted += task_hours_to_complete;
 
                                             if (taskInArray.HoursRemaining <= 0.01) {
-                                                completed_operations.push({ Project: task_to_assign.Project, SKU: task_to_assign.SKU, Order: task_to_assign.Order, TaskID: task_to_assign.TaskID, Operation: task_to_assign.Operation, CompletionDate: new Date(current_date) });
+                                                const completionRecord = { Project: task_to_assign.Project, SKU: task_to_assign.SKU, Order: task_to_assign.Order, TaskID: task_to_assign.TaskID, Operation: task_to_assign.Operation, CompletionDate: new Date(current_date) };
+                                                completed_operations.push(completionRecord);
+                                                completedByTaskId.set(task_to_assign.TaskID, completionRecord);
                                                 completedTaskIDs.add(task_to_assign.TaskID);
                                                 // Track completion at this Order level for dwell time boosting
                                                 const compKey = `${taskInArray.Project}|${taskInArray.SKU}|${taskInArray.Order}`;
@@ -1069,7 +1113,7 @@ const runSchedulingEngine = async (
                     const ptoForDay = ptoMap[dayStr] || new Set();
                     if (!ptoForDay.has(h.name)) {
                         let hours = parseFloat(params.hoursPerDay);
-                        const override = workHourOverrides.find(o => o.team === h.primaryTeam && dayStr >= o.startDate && dayStr <= o.endDate);
+                        const override = findWorkHourOverride(h.primaryTeam, dayStr);
                         if (override) hours = parseFloat(override.hours);
                         weeklyHybridCapacity += hours;
                     }
@@ -1085,7 +1129,7 @@ const runSchedulingEngine = async (
                     const day = new Date(weekStartDate); day.setDate(day.getDate() + i + (day.getDay() === 6 ? 2 : day.getDay() === 0 ? 1 : 0));
                     const dayStr = formatDate(day); if(holidayList.has(dayStr)) continue;
                     let currentHours = parseFloat(params.hoursPerDay);
-                    const override = workHourOverrides.find(o => o.team === teamName && dayStr >= o.startDate && dayStr <= o.endDate);
+                    const override = findWorkHourOverride(teamName, dayStr);
                     if (override) currentHours = parseFloat(override.hours);
                     let dailyHeadcount = teamDefs.headcounts.find(h => h.name === teamName)?.count || 0;
                     const ptoForDay = ptoMap[dayStr] || new Set();
