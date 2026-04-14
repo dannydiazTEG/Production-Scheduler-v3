@@ -249,11 +249,23 @@ async function submitRun(body) {
     throw new Error(`Timed out waiting for server to free up after ${MAX_BUSY_WAITS} attempts.`);
 }
 
+// Adaptive poll interval. Runs that hit the result cache return in <1s,
+// typical engine runs in 1-5s. Polling every 10s (old behaviour) wasted
+// up to 10s per iteration of pure idle time.
+const FAST_POLL_MS = 1000;
+const STEADY_POLL_MS = 2000;
+const FAST_POLL_ATTEMPTS = 10;
+// 10 × 1s + 295 × 2s = 600s upper bound — matches server timeout.
+const MAX_POLL_ATTEMPTS = 305;
+function pollDelayMs(attempt) {
+    return attempt < FAST_POLL_ATTEMPTS ? FAST_POLL_MS : STEADY_POLL_MS;
+}
+
 // Poll a job to terminal state without caring about result shape — used when we're
 // just waiting for someone else's job to drain so we can submit our own.
 async function waitForJobToFinish(jobId) {
-    for (let i = 0; i < 120; i++) {
-        await sleep(10000);
+    for (let i = 0; i < MAX_POLL_ATTEMPTS; i++) {
+        await sleep(pollDelayMs(i));
         try {
             const resp = await fetch(`${SERVER_URL}/api/schedule/status/${jobId}`);
             if (resp.status === 404) return; // job expired — it's gone, safe to submit
@@ -379,8 +391,8 @@ function validateAndCleanProposal(proposal, baseHeadcounts, existingOTWindows, s
 }
 
 async function pollJob(jobId) {
-    for (let i = 0; i < 60; i++) {
-        await sleep(10000);
+    for (let i = 0; i < MAX_POLL_ATTEMPTS; i++) {
+        await sleep(pollDelayMs(i));
         try {
             const job = await fetchJson(`${SERVER_URL}/api/schedule/status/${jobId}`);
             if (job.status === 'complete') {
@@ -716,6 +728,25 @@ async function main() {
     data.params.startDate = startDateStr;
     console.log(`Start date: ${startDateStr}${START_OFFSET_DAYS > 0 ? ` (+${START_OFFSET_DAYS} days offset for lead prep)` : ' (today)'}\n`);
 
+    // 1.5 Clear the completed-ops cache so every iteration sees a single
+    // consistent DB snapshot. Run results are left intact — if last night's run
+    // already produced the same (tasks + weights), we skip that iteration outright.
+    try {
+        const refreshResp = await fetch(`${SERVER_URL}/api/cache/refresh`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ scope: 'completed_ops' }),
+        });
+        if (refreshResp.ok) {
+            const r = await refreshResp.json();
+            console.log(`Cache pre-warm: cleared ${r.invalidated ?? 0} completed-ops rows, gc'd ${r.gcRemoved ?? 0} expired.\n`);
+        } else {
+            console.log(`Cache pre-warm skipped (HTTP ${refreshResp.status}).\n`);
+        }
+    } catch (e) {
+        console.log(`Cache pre-warm skipped: ${e.message}\n`);
+    }
+
     // 2. Baseline: default weights, fixed horizon, run DB-filter once to get a
     // reusable task set for subsequent iterations.
     console.log(`=== BASELINE (default weights, horizon=${DEFAULT_HORIZON_MONTHS}mo) ===`);
@@ -747,14 +778,19 @@ async function main() {
         reasoning: 'fixed baseline',
     }];
 
+    // Rolling counters — surfaced in final summary.
+    const iterStats = { llmMs: 0, runMs: 0, cacheHits: 0 };
+
     // 3. Iterate with LLM
     for (let iter = 1; iter <= MAX_ITERATIONS; iter++) {
+        const iterStart = Date.now();
         console.log(`\n=== ITER ${iter}/${MAX_ITERATIONS} ===`);
 
         let proposal;
         let proposalUsage;
         const currentOTWindows = data.workHourOverrides || [];
         const currentHeadcounts = data.teamDefs?.headcounts || [];
+        const llmStart = Date.now();
         try {
             const r = await proposeNextRun(history, bestScore, bestConfig, iter, currentOTWindows, currentHeadcounts);
             proposal = r.proposal;
@@ -764,7 +800,9 @@ async function main() {
             // Validate and enforce real-world constraints before running
             proposal = validateAndCleanProposal(proposal, currentHeadcounts, currentOTWindows, startDateStr);
 
-            console.log(`  LLM proposal: ${describeProposal(proposal)}`);
+            const llmMs = Date.now() - llmStart;
+            iterStats.llmMs += llmMs;
+            console.log(`  LLM proposal (${llmMs}ms): ${describeProposal(proposal)}`);
             console.log(`  Reasoning: ${proposal.reasoning}`);
         } catch (e) {
             console.log(`  LLM proposal failed (${e.message}). Falling back to current best weights unchanged.`);
@@ -787,12 +825,18 @@ async function main() {
             continue;
         }
 
+        const runStart = Date.now();
         try {
             // Pass the baseline's DB-filtered task set so every iteration sees the
             // same ground truth as the baseline did.
             const result = await runWithConfig(data, proposal, proposal.horizonMonths, /* skipDbFilter */ true, preparedTasks);
+            const runMs = Date.now() - runStart;
+            iterStats.runMs += runMs;
+            const cacheHit = result.fromCache === true;
+            if (cacheHit) iterStats.cacheHits += 1;
             const s = result.score;
             logScore(`Iter ${iter}`, s);
+            console.log(`  Run ${cacheHit ? 'served from cache' : 'completed'} in ${runMs}ms | iter total ${Date.now() - iterStart}ms`);
 
             if (s.feasible && s.compositeScore > bestScore.compositeScore) {
                 console.log(`  *** NEW BEST! ${bestScore.compositeScore} → ${s.compositeScore} ***`);
@@ -814,6 +858,8 @@ async function main() {
                 scheduleParams: proposal.scheduleParams || null,
                 storeBreakdown: s.storeBreakdown || [],
                 categories: s.categories || null,
+                cacheHit,
+                runMs,
             });
         } catch (e) {
             console.log(`  Run error: ${e.message}`);
@@ -842,6 +888,11 @@ async function main() {
     console.log(`Best:     ${bestScore.compositeScore}/100 (${bestScore.grade})`);
     console.log(`Delta:    ${bestScore.compositeScore > baseScore.compositeScore ? '+' : ''}${(bestScore.compositeScore - baseScore.compositeScore).toFixed(1)} pts`);
     console.log(`LLM calls: ${tokenAcc.calls} | Tokens: ${tokenAcc.inputTokens} in, ${tokenAcc.outputTokens} out | Est cost: $${estimateCost(tokenAcc).toFixed(3)}`);
+    if (!DRY_RUN && MAX_ITERATIONS > 0) {
+        const avgLlm = (iterStats.llmMs / MAX_ITERATIONS).toFixed(0);
+        const avgRun = (iterStats.runMs / MAX_ITERATIONS).toFixed(0);
+        console.log(`Timing:    avg LLM ${avgLlm}ms/iter, avg run ${avgRun}ms/iter | result-cache hits: ${iterStats.cacheHits}/${MAX_ITERATIONS}`);
+    }
     console.log(`========================================\n`);
 
     // 5. Email report
