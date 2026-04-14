@@ -32,6 +32,14 @@ const DEFAULT_HORIZON_MONTHS = parseInt(argOf('--horizon', process.env.OPTIMIZER
 const DRY_RUN = process.argv.includes('--dry-run');
 const MODEL = process.env.OPTIMIZER_MODEL || 'claude-sonnet-4-5';
 
+// Email recipients — comma-separated list via env var or CLI.
+// Defaults to Danny only (no summary recipients) for safe test runs.
+const RECIPIENTS_RAW = argOf('--recipients', process.env.OPTIMIZER_RECIPIENTS || 'danny.diaz@theescapegame.com');
+const EMAIL_RECIPIENTS = {
+    detailed: RECIPIENTS_RAW.split(',').map(e => e.trim()).filter(Boolean),
+    summary: [],  // Summary recipients (e.g. Dan Oliver) added once output is validated
+};
+
 function argOf(flag, fallback) {
     const idx = process.argv.indexOf(flag);
     return idx !== -1 && idx + 1 < process.argv.length ? process.argv[idx + 1] : fallback;
@@ -382,6 +390,7 @@ async function main() {
     console.log(`Model: ${MODEL}`);
     console.log(`Server: ${SERVER_URL}`);
     console.log(`Iterations: ${MAX_ITERATIONS} | Default horizon: ${DEFAULT_HORIZON_MONTHS}mo | Dry-run: ${DRY_RUN}`);
+    console.log(`Email recipients: ${EMAIL_RECIPIENTS.detailed.join(', ') || '(none)'}`);
     console.log(`Time: ${new Date().toISOString()}\n`);
 
     const tokenAcc = { inputTokens: 0, outputTokens: 0, calls: 0 };
@@ -552,6 +561,7 @@ async function main() {
                 strategistNotes: narrativeResult.text,
                 totalIterations: history.length,
                 durationMinutes: elapsed,
+                recipients: EMAIL_RECIPIENTS,
             }),
         });
         console.log('Report sent:', reportResp.message || 'OK');

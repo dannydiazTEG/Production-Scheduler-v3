@@ -15,14 +15,22 @@ services:
     name: schedule-optimizer
     env: node
     buildCommand: cd scheduler-backend && npm install
-    startCommand: cd scheduler-backend && node optimizer-cron.js --iterations 3
+    startCommand: cd scheduler-backend && node optimizer-cron.js
     schedule: "0 1 * * 1-5"
     envVars:
       - key: SERVER_URL
         value: https://production-scheduler-backend-aepw.onrender.com
       - key: NODE_ENV
         value: production
-      # ANTHROPIC_API_KEY must be set via the Render dashboard (never commit the key).
-      # It is required — optimizer-cron.js exits on startup without it.
+      # All tuning knobs below are set via the Render dashboard so changes take
+      # effect on the next trigger without needing a redeploy.
+      #   ANTHROPIC_API_KEY   — required (never commit the key)
+      #   OPTIMIZER_ITERATIONS — default 25
+      #   OPTIMIZER_HORIZON    — default 3 (months)
+      #   OPTIMIZER_RECIPIENTS — comma-separated emails; default Danny only
       - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: OPTIMIZER_ITERATIONS
+        sync: false
+      - key: OPTIMIZER_RECIPIENTS
         sync: false
