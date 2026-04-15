@@ -3225,6 +3225,51 @@ app.patch('/api/optimization-data/store-dates', async (req, res) => {
 });
 
 /**
+ * PATCH /api/optimization-data/config
+ * Update the config_json for the most recent optimization_inputs row.
+ * Two modes:
+ *   1. Full replace: { config: { ... } }  — overwrites config_json entirely.
+ *   2. Shallow merge: { merge: { params: {...}, teamDefs: {...}, ... } }
+ *      — spreads top-level keys onto the existing config (does NOT deep-merge nested objects).
+ * Returns the updated config.
+ */
+app.patch('/api/optimization-data/config', async (req, res) => {
+    const { config, merge } = req.body || {};
+    if (!config && !merge) {
+        return res.status(400).json({ error: 'Provide either { config } to replace or { merge } to shallow-merge.' });
+    }
+    if (config && merge) {
+        return res.status(400).json({ error: 'Provide only one of { config } or { merge }.' });
+    }
+
+    try {
+        if (!pgPool) return res.status(503).json({ error: 'Database not configured.' });
+
+        const result = await pgPool.query(
+            'SELECT id, config_json FROM optimization_inputs ORDER BY uploaded_at DESC LIMIT 1'
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'No optimization data uploaded yet.' });
+        }
+
+        const row = result.rows[0];
+        const existing = typeof row.config_json === 'string' ? JSON.parse(row.config_json) : row.config_json;
+        const nextConfig = config ? config : { ...existing, ...merge };
+
+        await pgPool.query(
+            'UPDATE optimization_inputs SET config_json = $1 WHERE id = $2',
+            [JSON.stringify(nextConfig), row.id]
+        );
+
+        console.log(`Config updated (mode=${config ? 'replace' : 'merge'}, keys=${Object.keys(config || merge).join(', ')}).`);
+        res.json({ success: true, mode: config ? 'replace' : 'merge', config: nextConfig });
+    } catch (e) {
+        console.error('Failed to update config:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
  * GET /api/optimization-data/latest
  * Fetch the most recent optimization data upload.
  * Returns parsed tasks, dates CSV text, and config ready for /api/optimize-run.
