@@ -2981,6 +2981,86 @@ app.post('/api/optimization-data', async (req, res) => {
 });
 
 /**
+ * PATCH /api/optimization-data/store-dates
+ * Update individual store due dates without re-uploading the full dataset.
+ * Body: { updates: [{ store: "Fulton", installDate: "7/1/2026", productionDueDate: "6/21/2026" }] }
+ * Modifies the dates_csv column in the most recent optimization_inputs row.
+ */
+app.patch('/api/optimization-data/store-dates', async (req, res) => {
+    const { updates } = req.body;
+    if (!updates || !Array.isArray(updates) || updates.length === 0) {
+        return res.status(400).json({ error: 'Missing required field: updates (array of {store, productionDueDate, installDate?})' });
+    }
+
+    try {
+        if (!pgPool) {
+            return res.status(503).json({ error: 'Database not configured.' });
+        }
+
+        // Fetch the latest row
+        const result = await pgPool.query(
+            'SELECT id, dates_csv FROM optimization_inputs ORDER BY uploaded_at DESC LIMIT 1'
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'No optimization data uploaded yet.' });
+        }
+
+        const row = result.rows[0];
+        const lines = row.dates_csv.trim().split('\n');
+        const headers = lines[0].split(',').map(h => h.trim());
+        const projectIdx = headers.findIndex(h => /^project$/i.test(h));
+        const dueDateIdx = headers.findIndex(h => /production\s*due\s*date/i.test(h));
+        const installIdx = headers.findIndex(h => /install\s*date/i.test(h));
+
+        if (projectIdx === -1 || dueDateIdx === -1) {
+            return res.status(500).json({ error: 'Could not find Project / Production Due Date columns in dates CSV.' });
+        }
+
+        // Build a lookup of updates by store name (case-insensitive)
+        const updateMap = new Map();
+        for (const u of updates) {
+            updateMap.set((u.store || '').toLowerCase().trim(), u);
+        }
+
+        // Apply updates
+        const applied = [];
+        for (let i = 1; i < lines.length; i++) {
+            const cols = lines[i].split(',');
+            const storeName = (cols[projectIdx] || '').trim();
+            const update = updateMap.get(storeName.toLowerCase().trim());
+            if (update) {
+                const oldDue = cols[dueDateIdx];
+                const oldInstall = installIdx !== -1 ? cols[installIdx] : null;
+                if (update.productionDueDate) cols[dueDateIdx] = update.productionDueDate;
+                if (update.installDate && installIdx !== -1) cols[installIdx] = update.installDate;
+                lines[i] = cols.join(',');
+                applied.push({
+                    store: storeName,
+                    oldDueDate: oldDue,
+                    newDueDate: update.productionDueDate || oldDue,
+                    oldInstallDate: oldInstall,
+                    newInstallDate: update.installDate || oldInstall,
+                });
+            }
+        }
+
+        if (applied.length === 0) {
+            return res.status(404).json({ error: 'No matching stores found in dates CSV.', requested: updates.map(u => u.store) });
+        }
+
+        // Write back
+        const newCsv = lines.join('\n');
+        await pgPool.query('UPDATE optimization_inputs SET dates_csv = $1 WHERE id = $2', [newCsv, row.id]);
+
+        console.log(`Store dates updated: ${applied.map(a => `${a.store}: ${a.oldDueDate} → ${a.newDueDate}`).join(', ')}`);
+        res.json({ success: true, applied, message: `Updated ${applied.length} store date(s).` });
+    } catch (e) {
+        console.error('Failed to update store dates:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
  * GET /api/optimization-data/latest
  * Fetch the most recent optimization data upload.
  * Returns parsed tasks, dates CSV text, and config ready for /api/optimize-run.
