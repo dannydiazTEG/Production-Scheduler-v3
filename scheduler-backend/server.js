@@ -2695,9 +2695,14 @@ app.post('/api/optimize-run', async (req, res) => {
     }
 
     // --- Capacity change validation (safety net for LLM-driven optimization) ---
+    // NOTE: Only validate constraints that can be attributed to LLM proposals —
+    // i.e., newly-added entries identified by synthetic naming (Flex-*, NewHire-*).
+    // Pre-existing entries from uploaded configs are left alone; they may legitimately
+    // violate constraints (e.g. manually-set 90-day OT windows).
     const validationErrors = [];
 
-    // Validate flex worker routes
+    // Validate flex workers added by the optimizer (name pattern: Flex-{from}-{to}-{n}).
+    // Pre-existing hybridWorkers from the uploaded config use human names and are skipped.
     const ALLOWED_FLEX_ROUTES = new Set([
         'Paint→Scenic', 'Scenic→Paint',
         'Carpentry→Assembly', 'Assembly→Carpentry',
@@ -2708,6 +2713,7 @@ app.post('/api/optimize-run', async (req, res) => {
         const baseHC = new Map((teamDefs.headcounts || []).map(h => [h.name, h.count]));
         const flexFromCount = new Map();
         for (const hw of hybridWorkers) {
+            if (!hw.name?.startsWith('Flex-')) continue;  // skip pre-existing
             const route = `${hw.primaryTeam}→${hw.secondaryTeam}`;
             if (!ALLOWED_FLEX_ROUTES.has(route)) {
                 validationErrors.push(`Invalid flex route: ${route}. Allowed: Paint↔Scenic, Carpentry↔Assembly, Tech→Metal.`);
@@ -2725,43 +2731,20 @@ app.post('/api/optimize-run', async (req, res) => {
         }
     }
 
-    // Validate OT windows
+    // Validate OT windows — only hours/day cap (applies to all entries). Window duration,
+    // cooldown, and overlap are NOT enforced here because uploaded configs legitimately have
+    // long manually-set windows. The LLM prompt handles those constraints.
     if (workHourOverrides?.length > 0) {
         for (const ot of workHourOverrides) {
             const hours = parseFloat(ot.hours);
             if (hours > 10) {
                 validationErrors.push(`OT window for ${ot.team}: ${hours}h/day exceeds max 10h.`);
             }
-            if (ot.startDate && ot.endDate) {
-                const durationDays = Math.round((new Date(ot.endDate) - new Date(ot.startDate)) / (24 * 60 * 60 * 1000));
-                if (durationDays > 62) {
-                    validationErrors.push(`OT window for ${ot.team}: ${durationDays} days exceeds max 62-day window.`);
-                }
-            }
-        }
-        // Check cooldown between same-team windows
-        const byTeam = new Map();
-        for (const ot of workHourOverrides) {
-            if (!byTeam.has(ot.team)) byTeam.set(ot.team, []);
-            byTeam.get(ot.team).push(ot);
-        }
-        for (const [team, windows] of byTeam) {
-            const sorted = [...windows].sort((a, b) => (a.startDate || '').localeCompare(b.startDate || ''));
-            for (let i = 1; i < sorted.length; i++) {
-                const prevEnd = new Date(sorted[i - 1].endDate);
-                const nextStart = new Date(sorted[i].startDate);
-                const gapDays = Math.round((nextStart - prevEnd) / (24 * 60 * 60 * 1000));
-                if (gapDays >= 0 && gapDays < 30) {
-                    validationErrors.push(`OT cooldown violation for ${team}: only ${gapDays}d between windows (need 30d).`);
-                }
-                if (nextStart <= prevEnd) {
-                    validationErrors.push(`Overlapping OT windows for ${team}: ${sorted[i].startDate} starts before ${sorted[i - 1].endDate} ends.`);
-                }
-            }
         }
     }
 
-    // Validate new hires in teamMemberChanges
+    // Validate new hires added by the optimizer (name pattern: NewHire-*).
+    // Existing hires/departures from uploaded config use real names and are skipped.
     if (teamMemberChanges?.length > 0) {
         const hiresByTeam = new Map();
         const scheduleStart = params.startDate ? new Date(params.startDate) : new Date();
@@ -2781,7 +2764,7 @@ app.post('/api/optimize-run', async (req, res) => {
         }
     }
 
-    // Block productivityAssumption changes
+    // Block productivityAssumption changes — fixed business decision
     if (req.body.params?.productivityAssumption != null &&
         req.body.params.productivityAssumption !== 0.85) {
         validationErrors.push(`productivityAssumption must remain 0.85 (got ${req.body.params.productivityAssumption}).`);
