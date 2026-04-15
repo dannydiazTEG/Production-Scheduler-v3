@@ -2764,11 +2764,10 @@ app.post('/api/optimize-run', async (req, res) => {
         }
     }
 
-    // Block productivityAssumption changes — fixed business decision
-    if (req.body.params?.productivityAssumption != null &&
-        req.body.params.productivityAssumption !== 0.85) {
-        validationErrors.push(`productivityAssumption must remain 0.85 (got ${req.body.params.productivityAssumption}).`);
-    }
+    // productivityAssumption intentionally NOT validated at the API level — the server
+    // can't distinguish the uploaded config value (e.g. 0.81 for external reporting) from
+    // an LLM-proposed change. Enforcement lives in the LLM prompt and in optimizer-cron's
+    // validateAndCleanProposal (which strips scheduleParams.productivityAssumption).
 
     if (validationErrors.length > 0) {
         jobs[jobId].status = 'error';
