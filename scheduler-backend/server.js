@@ -2981,6 +2981,81 @@ app.post('/api/optimization-data', async (req, res) => {
 });
 
 /**
+ * POST /api/trigger-optimizer
+ * Spawn optimizer-cron.js as a background child process on the server.
+ * Uses the server's own environment (ANTHROPIC_API_KEY, SERVER_URL, etc.).
+ * Returns immediately with a status you can poll.
+ *
+ * Body (all optional):
+ *   iterations: number (default from OPTIMIZER_ITERATIONS env or 25)
+ *   horizon: number (default from OPTIMIZER_HORIZON env or 3)
+ *   startOffsetDays: number (default from OPTIMIZER_START_OFFSET_DAYS env or 0)
+ *   recipients: string (comma-separated emails, default from OPTIMIZER_RECIPIENTS env)
+ */
+const { spawn } = require('child_process');
+const path = require('path');
+
+let activeOptimizer = null;
+
+app.post('/api/trigger-optimizer', (req, res) => {
+    if (activeOptimizer && !activeOptimizer.killed) {
+        return res.status(503).json({ error: 'An optimizer run is already in progress.', pid: activeOptimizer.pid });
+    }
+
+    const iterations = req.body.iterations || process.env.OPTIMIZER_ITERATIONS || '25';
+    const horizon = req.body.horizon || process.env.OPTIMIZER_HORIZON || '3';
+    const startOffset = req.body.startOffsetDays || process.env.OPTIMIZER_START_OFFSET_DAYS || '0';
+    const recipients = req.body.recipients || process.env.OPTIMIZER_RECIPIENTS || '';
+
+    const env = {
+        ...process.env,
+        SERVER_URL: process.env.SERVER_URL || `http://localhost:${process.env.PORT || 3000}`,
+        OPTIMIZER_ITERATIONS: String(iterations),
+        OPTIMIZER_HORIZON: String(horizon),
+        OPTIMIZER_START_OFFSET_DAYS: String(startOffset),
+    };
+    if (recipients) env.OPTIMIZER_RECIPIENTS = recipients;
+
+    const cronPath = path.join(__dirname, 'optimizer-cron.js');
+    const child = spawn('node', [cronPath], {
+        env,
+        cwd: __dirname,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: false,
+    });
+
+    activeOptimizer = child;
+    const logs = [];
+    child.stdout.on('data', d => {
+        const line = d.toString().trim();
+        if (line) logs.push(line);
+        if (logs.length > 200) logs.shift(); // keep tail
+    });
+    child.stderr.on('data', d => {
+        const line = d.toString().trim();
+        if (line) logs.push(`[stderr] ${line}`);
+    });
+    child.on('close', (code) => {
+        console.log(`Optimizer process exited with code ${code}`);
+        activeOptimizer = null;
+    });
+
+    console.log(`Optimizer triggered: iterations=${iterations}, horizon=${horizon}, offset=${startOffset}, pid=${child.pid}`);
+    res.status(202).json({
+        message: 'Optimizer started.',
+        pid: child.pid,
+        config: { iterations, horizon, startOffsetDays: startOffset },
+    });
+});
+
+app.get('/api/trigger-optimizer/status', (req, res) => {
+    if (!activeOptimizer || activeOptimizer.killed) {
+        return res.json({ running: false });
+    }
+    res.json({ running: true, pid: activeOptimizer.pid });
+});
+
+/**
  * PATCH /api/optimization-data/store-dates
  * Update individual store due dates without re-uploading the full dataset.
  * Body: { updates: [{ store: "Fulton", installDate: "7/1/2026", productionDueDate: "6/21/2026" }] }
