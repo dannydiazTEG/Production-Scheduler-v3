@@ -3013,11 +3013,32 @@ app.post('/api/optimize-run', async (req, res) => {
 });
 
 /**
+ * Admin gate middleware for baseline file writes.
+ * Reads the expected token from process.env.ADMIN_TOKEN. When that env var is
+ * unset, all writes are rejected (fail-closed) so accidentally-deployed
+ * instances without the secret can't be mutated by the public internet.
+ * Client sends its token via the X-Admin-Token header.
+ */
+function requireAdminToken(req, res, next) {
+    const expected = process.env.ADMIN_TOKEN;
+    if (!expected) {
+        return res.status(503).json({
+            error: 'Admin operations disabled: ADMIN_TOKEN environment variable is not set on the server.',
+        });
+    }
+    const provided = req.headers['x-admin-token'];
+    if (!provided || provided !== expected) {
+        return res.status(401).json({ error: 'Missing or invalid X-Admin-Token header.' });
+    }
+    next();
+}
+
+/**
  * POST /api/optimization-data
  * Upload task CSV, dates CSV, and config JSON for the agent to use.
  * Stores in Postgres optimization_inputs table.
  */
-app.post('/api/optimization-data', async (req, res) => {
+app.post('/api/optimization-data', requireAdminToken, async (req, res) => {
     const { tasksCsv, datesCsv, configJson } = req.body;
 
     if (!tasksCsv || !datesCsv || !configJson) {
@@ -3150,7 +3171,7 @@ app.get('/api/trigger-optimizer/status', (req, res) => {
  * Body: { updates: [{ store: "Fulton", installDate: "7/1/2026", productionDueDate: "6/21/2026" }] }
  * Modifies the dates_csv column in the most recent optimization_inputs row.
  */
-app.patch('/api/optimization-data/store-dates', async (req, res) => {
+app.patch('/api/optimization-data/store-dates', requireAdminToken, async (req, res) => {
     const { updates } = req.body;
     if (!updates || !Array.isArray(updates) || updates.length === 0) {
         return res.status(400).json({ error: 'Missing required field: updates (array of {store, productionDueDate, installDate?})' });
@@ -3233,7 +3254,7 @@ app.patch('/api/optimization-data/store-dates', async (req, res) => {
  *      — spreads top-level keys onto the existing config (does NOT deep-merge nested objects).
  * Returns the updated config.
  */
-app.patch('/api/optimization-data/config', async (req, res) => {
+app.patch('/api/optimization-data/config', requireAdminToken, async (req, res) => {
     const { config, merge } = req.body || {};
     if (!config && !merge) {
         return res.status(400).json({ error: 'Provide either { config } to replace or { merge } to shallow-merge.' });
@@ -3311,6 +3332,137 @@ app.get('/api/optimization-data/latest', async (req, res) => {
         });
     } catch (e) {
         console.error('Failed to fetch optimization data:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * GET /api/optimization-data/latest/raw
+ * Returns the raw CSV strings and config JSON as stored, without server-side
+ * parsing of the tasks CSV. Used by the admin UI so it can download the exact
+ * source files and produce diffs against them.
+ */
+app.get('/api/optimization-data/latest/raw', async (req, res) => {
+    try {
+        if (!pgPool) return res.status(503).json({ error: 'Database not configured.' });
+        const result = await pgPool.query(
+            'SELECT id, tasks_csv, dates_csv, config_json, uploaded_at FROM optimization_inputs ORDER BY uploaded_at DESC LIMIT 1'
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'No optimization data uploaded yet.' });
+        }
+        const row = result.rows[0];
+        const configJson = typeof row.config_json === 'string' ? JSON.parse(row.config_json) : row.config_json;
+        res.json({
+            id: row.id,
+            tasksCsv: row.tasks_csv,
+            datesCsv: row.dates_csv,
+            configJson,
+            uploadedAt: row.uploaded_at,
+        });
+    } catch (e) {
+        console.error('Failed to fetch raw optimization data:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * PATCH /api/optimization-data/tasks
+ * Body: { tasksCsv: "<raw csv string>" }
+ * Updates only the tasks_csv column of the most recent optimization_inputs row.
+ */
+app.patch('/api/optimization-data/tasks', requireAdminToken, async (req, res) => {
+    const { tasksCsv } = req.body || {};
+    if (typeof tasksCsv !== 'string' || tasksCsv.trim().length === 0) {
+        return res.status(400).json({ error: 'Missing or empty field: tasksCsv (string).' });
+    }
+    try {
+        if (!pgPool) return res.status(503).json({ error: 'Database not configured.' });
+        const result = await pgPool.query(
+            'SELECT id FROM optimization_inputs ORDER BY uploaded_at DESC LIMIT 1'
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'No optimization data uploaded yet.' });
+        }
+        const { id } = result.rows[0];
+        await pgPool.query('UPDATE optimization_inputs SET tasks_csv = $1 WHERE id = $2', [tasksCsv, id]);
+        console.log(`Tasks CSV updated for optimization_inputs id=${id} (${tasksCsv.length} chars).`);
+        res.json({ success: true, id, tasksCsvLength: tasksCsv.length });
+    } catch (e) {
+        console.error('Failed to update tasks CSV:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * PATCH /api/optimization-data/dates
+ * Body: { datesCsv: "<raw csv string>" }
+ * Updates only the dates_csv column of the most recent optimization_inputs row.
+ * For per-row updates, use PATCH /api/optimization-data/store-dates instead.
+ */
+app.patch('/api/optimization-data/dates', requireAdminToken, async (req, res) => {
+    const { datesCsv } = req.body || {};
+    if (typeof datesCsv !== 'string' || datesCsv.trim().length === 0) {
+        return res.status(400).json({ error: 'Missing or empty field: datesCsv (string).' });
+    }
+    try {
+        if (!pgPool) return res.status(503).json({ error: 'Database not configured.' });
+        const result = await pgPool.query(
+            'SELECT id FROM optimization_inputs ORDER BY uploaded_at DESC LIMIT 1'
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: 'No optimization data uploaded yet.' });
+        }
+        const { id } = result.rows[0];
+        await pgPool.query('UPDATE optimization_inputs SET dates_csv = $1 WHERE id = $2', [datesCsv, id]);
+        console.log(`Dates CSV updated for optimization_inputs id=${id} (${datesCsv.length} chars).`);
+        res.json({ success: true, id, datesCsvLength: datesCsv.length });
+    } catch (e) {
+        console.error('Failed to update dates CSV:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+/**
+ * GET /api/optimization-data/history
+ * Returns a lightweight summary of the last 5 optimization_inputs rows
+ * (the retention cap enforced by POST /api/optimization-data). Used by the
+ * admin UI's history tab. Does NOT include the full tasks_csv payload
+ * to keep the response small.
+ */
+app.get('/api/optimization-data/history', async (req, res) => {
+    try {
+        if (!pgPool) return res.status(503).json({ error: 'Database not configured.' });
+        const result = await pgPool.query(
+            `SELECT id, uploaded_at, config_json,
+                    LENGTH(tasks_csv) AS tasks_csv_length,
+                    LENGTH(dates_csv) AS dates_csv_length
+             FROM optimization_inputs
+             ORDER BY uploaded_at DESC
+             LIMIT 5`
+        );
+        const snapshots = result.rows.map(row => {
+            const config = typeof row.config_json === 'string' ? JSON.parse(row.config_json) : row.config_json;
+            const headcounts = config?.teamDefs?.headcounts || [];
+            const mapping = config?.teamDefs?.mapping || [];
+            return {
+                id: row.id,
+                uploadedAt: row.uploaded_at,
+                tasksCsvLength: row.tasks_csv_length,
+                datesCsvLength: row.dates_csv_length,
+                configSummary: {
+                    startDate: config?.params?.startDate || null,
+                    teamCount: headcounts.length,
+                    mappingCount: mapping.length,
+                    otWindowCount: (config?.workHourOverrides || []).length,
+                    hireCount: (config?.teamMemberChanges || []).length,
+                    flexCount: (config?.hybridWorkers || []).length,
+                },
+            };
+        });
+        res.json({ snapshots });
+    } catch (e) {
+        console.error('Failed to fetch optimization history:', e);
         res.status(500).json({ error: e.message });
     }
 });
