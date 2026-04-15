@@ -2694,6 +2694,105 @@ app.post('/api/optimize-run', async (req, res) => {
         return res.status(400).json({ error: jobs[jobId].error });
     }
 
+    // --- Capacity change validation (safety net for LLM-driven optimization) ---
+    const validationErrors = [];
+
+    // Validate flex worker routes
+    const ALLOWED_FLEX_ROUTES = new Set([
+        'Paint→Scenic', 'Scenic→Paint',
+        'Carpentry→Assembly', 'Assembly→Carpentry',
+        'Tech→Metal',
+    ]);
+    const NO_FLEX_TEAMS = new Set(['CNC', 'Receiving', 'QC']);
+    if (hybridWorkers?.length > 0) {
+        const baseHC = new Map((teamDefs.headcounts || []).map(h => [h.name, h.count]));
+        const flexFromCount = new Map();
+        for (const hw of hybridWorkers) {
+            const route = `${hw.primaryTeam}→${hw.secondaryTeam}`;
+            if (!ALLOWED_FLEX_ROUTES.has(route)) {
+                validationErrors.push(`Invalid flex route: ${route}. Allowed: Paint↔Scenic, Carpentry↔Assembly, Tech→Metal.`);
+            }
+            if (NO_FLEX_TEAMS.has(hw.primaryTeam)) {
+                validationErrors.push(`Cannot flex from ${hw.primaryTeam} — too specialized.`);
+            }
+            const count = (flexFromCount.get(hw.primaryTeam) || 0) + 1;
+            flexFromCount.set(hw.primaryTeam, count);
+            const teamHC = baseHC.get(hw.primaryTeam) || 0;
+            const maxFlex = Math.floor(teamHC * 0.20);
+            if (count > maxFlex) {
+                validationErrors.push(`Too many flex from ${hw.primaryTeam}: ${count} exceeds 20% cap (${maxFlex} max of ${teamHC}).`);
+            }
+        }
+    }
+
+    // Validate OT windows
+    if (workHourOverrides?.length > 0) {
+        for (const ot of workHourOverrides) {
+            const hours = parseFloat(ot.hours);
+            if (hours > 10) {
+                validationErrors.push(`OT window for ${ot.team}: ${hours}h/day exceeds max 10h.`);
+            }
+            if (ot.startDate && ot.endDate) {
+                const durationDays = Math.round((new Date(ot.endDate) - new Date(ot.startDate)) / (24 * 60 * 60 * 1000));
+                if (durationDays > 62) {
+                    validationErrors.push(`OT window for ${ot.team}: ${durationDays} days exceeds max 62-day window.`);
+                }
+            }
+        }
+        // Check cooldown between same-team windows
+        const byTeam = new Map();
+        for (const ot of workHourOverrides) {
+            if (!byTeam.has(ot.team)) byTeam.set(ot.team, []);
+            byTeam.get(ot.team).push(ot);
+        }
+        for (const [team, windows] of byTeam) {
+            const sorted = [...windows].sort((a, b) => (a.startDate || '').localeCompare(b.startDate || ''));
+            for (let i = 1; i < sorted.length; i++) {
+                const prevEnd = new Date(sorted[i - 1].endDate);
+                const nextStart = new Date(sorted[i].startDate);
+                const gapDays = Math.round((nextStart - prevEnd) / (24 * 60 * 60 * 1000));
+                if (gapDays >= 0 && gapDays < 30) {
+                    validationErrors.push(`OT cooldown violation for ${team}: only ${gapDays}d between windows (need 30d).`);
+                }
+                if (nextStart <= prevEnd) {
+                    validationErrors.push(`Overlapping OT windows for ${team}: ${sorted[i].startDate} starts before ${sorted[i - 1].endDate} ends.`);
+                }
+            }
+        }
+    }
+
+    // Validate new hires in teamMemberChanges
+    if (teamMemberChanges?.length > 0) {
+        const hiresByTeam = new Map();
+        const scheduleStart = params.startDate ? new Date(params.startDate) : new Date();
+        const earliestHire = new Date(scheduleStart);
+        earliestHire.setDate(earliestHire.getDate() + 28);
+        for (const change of teamMemberChanges) {
+            if (change.type === 'Starts' && change.name?.startsWith('NewHire')) {
+                const team = change.team;
+                hiresByTeam.set(team, (hiresByTeam.get(team) || 0) + 1);
+                if (hiresByTeam.get(team) > 3) {
+                    validationErrors.push(`Too many hires for ${team}: ${hiresByTeam.get(team)} exceeds max +3.`);
+                }
+                if (change.date && new Date(change.date) < earliestHire) {
+                    validationErrors.push(`Hire for ${team} starts ${change.date}, before earliest allowed ${earliestHire.toISOString().slice(0, 10)} (28d after schedule start).`);
+                }
+            }
+        }
+    }
+
+    // Block productivityAssumption changes
+    if (req.body.params?.productivityAssumption != null &&
+        req.body.params.productivityAssumption !== 0.85) {
+        validationErrors.push(`productivityAssumption must remain 0.85 (got ${req.body.params.productivityAssumption}).`);
+    }
+
+    if (validationErrors.length > 0) {
+        jobs[jobId].status = 'error';
+        jobs[jobId].error = `Validation failed: ${validationErrors.join(' | ')}`;
+        return res.status(400).json({ error: jobs[jobId].error, validationErrors });
+    }
+
     const forceFresh = req.query.fresh === '1' || req.query.fresh === 'true';
 
     res.status(202).json({ jobId });
