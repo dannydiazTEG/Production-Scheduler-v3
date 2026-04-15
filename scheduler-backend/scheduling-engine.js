@@ -62,6 +62,17 @@ const DEFAULT_PRIORITY_WEIGHTS = {
         { threshold: 4, multiplier: 1.5 },
     ],
     assemblyConstraintDefault: 1,  // Fallback when steps exceed all tiers
+
+    // Store-urgency boost — when a store is almost done and close to its due
+    // date, bump the priority of its remaining tasks so long tails don't drag
+    // the store's finish date past due (Option B in the tail-task discussion).
+    //
+    // Requires a storeDueDateMap argument to runSchedulingEngine; without it,
+    // the boost is a no-op even when enabled.
+    enableStoreUrgencyBoost: false,          // Feature flag, default off
+    storeUrgencyCompletionThreshold: 0.9,    // Store must be ≥90% done by hours
+    storeUrgencyDaysUntilDue: 30,            // And within 30 days of store due date
+    storeUrgencyMultiplier: 3.0,             // Boost applied to DynamicPriority
 };
 
 const TEAM_SORT_ORDER = ['Receiving', 'CNC', 'Metal', 'Scenic', 'Paint', 'Carpentry', 'Assembly', 'Tech', 'QC', 'Hybrid'];
@@ -98,7 +109,11 @@ const runSchedulingEngine = async (
     startDateOverrides, endDateOverrides,
     updateProgress,
     priorityWeights,
-    timings = NOOP_TIMINGS
+    timings = NOOP_TIMINGS,
+    // Optional Map<normalizedStoreName, Date> for store-urgency boost.
+    // When absent or when weights.enableStoreUrgencyBoost is false, the boost
+    // is a no-op (multiplier = 1 for every task).
+    storeDueDateMap = null,
 ) => {
     const logs = [];
     let error = '';
@@ -234,6 +249,22 @@ const runSchedulingEngine = async (
         const allOriginalSkuKeys = new Set(all_tasks_with_teams.map(task => `${task.Project}|${task.SKU}`));
         let operations_df = all_tasks_with_teams.filter(row => !teamsToIgnoreList.includes(row.Team));
         const schedulableSkuKeys = new Set(operations_df.map(task => `${task.Project}|${task.SKU}`));
+
+        // --- Store urgency setup (Option B) ---
+        // Build a per-store total hours map from the schedulable tasks. This is
+        // the denominator for the "fraction done" check that triggers the boost.
+        // Normalize store names the same way scoring.js does so lookups against
+        // storeDueDateMap succeed regardless of whitespace/case differences.
+        const normalizeStore = (name) => (name || '').toLowerCase().trim().replace(/\s+/g, ' ');
+        const storeOriginalHoursMap = new Map();
+        if (weights.enableStoreUrgencyBoost && storeDueDateMap) {
+            for (const task of operations_df) {
+                const key = normalizeStore(task.Store);
+                const hrs = parseFloat(task['Estimated Hours']) || 0;
+                storeOriginalHoursMap.set(key, (storeOriginalHoursMap.get(key) || 0) + hrs);
+            }
+            logs.push(`Store-urgency boost ENABLED: ${storeOriginalHoursMap.size} stores tracked, threshold ${(weights.storeUrgencyCompletionThreshold * 100).toFixed(0)}% done within ${weights.storeUrgencyDaysUntilDue}d of due → ${weights.storeUrgencyMultiplier}× boost.`);
+        }
         const fullyIgnoredSkuKeys = [...allOriginalSkuKeys].filter(key => !schedulableSkuKeys.has(key));
         let finalCompletions = [];
 
@@ -661,6 +692,36 @@ const runSchedulingEngine = async (
             dailyDwellingData[currentDateStr] = dwellingHoursToday;
 
             const _pPriStart = perfNow();
+
+            // --- Store urgency boost prep (Option B) ---
+            // Compute the boost multiplier per store once per day, then apply it
+            // to every task below. Only runs when the feature is enabled AND a
+            // storeDueDateMap was provided — otherwise every store's multiplier
+            // stays at 1.0 and no behavior changes.
+            const storeUrgencyMultByStore = new Map();
+            if (weights.enableStoreUrgencyBoost && storeDueDateMap && storeOriginalHoursMap.size > 0) {
+                // Sum remaining hours per store from unscheduled_tasks. This is
+                // O(tasks) per day; tasks are dropped from unscheduled_tasks as
+                // they complete so the set shrinks over time.
+                const storeRemaining = new Map();
+                for (const t of unscheduled_tasks) {
+                    const key = normalizeStore(t.Store);
+                    storeRemaining.set(key, (storeRemaining.get(key) || 0) + (t.HoursRemaining || 0));
+                }
+                for (const [storeKey, original] of storeOriginalHoursMap.entries()) {
+                    if (original <= 0) continue;
+                    const remaining = storeRemaining.get(storeKey) || 0;
+                    const fracDone = 1 - (remaining / original);
+                    if (fracDone < weights.storeUrgencyCompletionThreshold) continue;
+                    const due = storeDueDateMap.get(storeKey);
+                    if (!due) continue;
+                    const daysUntilDue = Math.floor((due - current_date) / (1000 * 60 * 60 * 24));
+                    if (daysUntilDue > weights.storeUrgencyDaysUntilDue) continue;
+                    // Store is near-done AND within the due-date window → boost
+                    storeUrgencyMultByStore.set(storeKey, weights.storeUrgencyMultiplier);
+                }
+            }
+
             unscheduled_tasks.forEach(task => {
                 const daysUntilDue = (task.DueDate - current_date) / (1000 * 60 * 60 * 24);
                 let dueDateMultiplier;
@@ -718,12 +779,20 @@ const runSchedulingEngine = async (
                 // In-progress boost: tasks currently being worked on in Fulcrum get priority
                 const inProgressMultiplier = task.InProgress ? weights.inProgressBoost : 1.0;
 
-                task.DynamicPriority = (task.BasePriority * dueDateMultiplier * assemblyGroupMultiplier * projectTypeMultiplier * dwellMultiplier * inProgressMultiplier) / task.TeamCapacity;
+                // Store-urgency multiplier (Option B): when the task's store
+                // is near-done and within the due-date window, boost to close
+                // out the tail instead of starting new work elsewhere.
+                const storeUrgencyMultiplier = storeUrgencyMultByStore.size > 0
+                    ? (storeUrgencyMultByStore.get(normalizeStore(task.Store)) || 1.0)
+                    : 1.0;
+
+                task.DynamicPriority = (task.BasePriority * dueDateMultiplier * assemblyGroupMultiplier * projectTypeMultiplier * dwellMultiplier * inProgressMultiplier * storeUrgencyMultiplier) / task.TeamCapacity;
                 task._dueDateMultiplier = dueDateMultiplier;
                 task._assemblyGroupMultiplier = assemblyGroupMultiplier;
                 // _projectTypeMultiplier already set at setup — it's stable across the run.
                 task._dwellMultiplier = dwellMultiplier;
                 task._inProgressMultiplier = inProgressMultiplier;
+                task._storeUrgencyMultiplier = storeUrgencyMultiplier;
             });
             timings.inc('priorityCalc.ms', perfNow() - _pPriStart);
 

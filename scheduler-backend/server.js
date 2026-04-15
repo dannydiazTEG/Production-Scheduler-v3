@@ -2871,6 +2871,28 @@ app.post('/api/optimize-run', async (req, res) => {
 
             updateProgress(15, 'Running scheduling engine...', 'simulating');
 
+            // Build a normalized store → due-date map so the engine can
+            // optionally apply the store-urgency boost. Matches scoring.js's
+            // normalizeStoreName so lookups cross both sides cleanly.
+            const storeDueDateMap = new Map();
+            try {
+                const parsed = parseDatesCsv(storeDueDatesCsv);
+                for (const [storeName, val] of parsed.entries()) {
+                    const dueStr = typeof val === 'object' ? val.dueDate : val;
+                    if (!dueStr) continue;
+                    const key = normalizeStoreName(storeName);
+                    // Reuse scoring.js's parseLocalDate via a quick inline parse
+                    const m = dueStr.match(/^(\d{4})-(\d{2})-(\d{2})/) || dueStr.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+                    if (!m) continue;
+                    const d = m[0].includes('-')
+                        ? new Date(+m[1], +m[2] - 1, +m[3])
+                        : new Date(+m[3], +m[1] - 1, +m[2]);
+                    if (!isNaN(d.getTime())) storeDueDateMap.set(key, d);
+                }
+            } catch (e) {
+                console.warn(`[Job ${jobId}] Could not build storeDueDateMap for urgency boost: ${e.message}`);
+            }
+
             timings.mark('engineCall.start');
             const engineResult = await runSchedulingEngine(
                 preparedTasks, params, teamDefs,
@@ -2880,7 +2902,8 @@ app.post('/api/optimize-run', async (req, res) => {
                 startDateOverrides || {}, endDateOverrides || {},
                 updateProgress,
                 priorityWeights || undefined,
-                timings
+                timings,
+                storeDueDateMap
             );
             timings.mark('engineCall.end');
 
