@@ -3033,10 +3033,18 @@ app.post('/api/trigger-optimizer', (req, res) => {
     });
     child.stderr.on('data', d => {
         const line = d.toString().trim();
-        if (line) logs.push(`[stderr] ${line}`);
+        if (line) {
+            logs.push(`[stderr] ${line}`);
+            console.log(`[optimizer stderr] ${line}`);
+        }
     });
     child.on('close', (code) => {
-        console.log(`Optimizer process exited with code ${code}`);
+        if (code !== 0) {
+            console.log(`Optimizer process CRASHED with code ${code}. Last output:`);
+            logs.slice(-10).forEach(l => console.log(`  ${l}`));
+        } else {
+            console.log(`Optimizer process completed successfully.`);
+        }
         activeOptimizer = null;
     });
 
