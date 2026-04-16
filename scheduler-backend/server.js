@@ -2979,6 +2979,7 @@ app.post('/api/optimize-run', async (req, res) => {
                 score: scoreData,
                 projectSummary: trimmed.projectSummary,
                 teamUtilization: trimmed.teamUtilization,
+                teamWorkload: trimmed.teamWorkload,
                 weeklyOutput: trimmed.weeklyOutput,
                 projectedCompletion: trimmed.projectedCompletion,
                 projectTypeMap,
