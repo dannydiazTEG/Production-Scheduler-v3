@@ -73,6 +73,13 @@ const DEFAULT_PRIORITY_WEIGHTS = {
     storeUrgencyCompletionThreshold: 0.9,    // Store must be ≥90% done by hours
     storeUrgencyDaysUntilDue: 30,            // And within 30 days of store due date
     storeUrgencyMultiplier: 3.0,             // Boost applied to DynamicPriority
+
+    // Bottleneck / constraint-feeding boost — when a task's completion feeds
+    // work into a constraint team within 1-2 steps, boost its priority so the
+    // constraint stays continuously fed instead of starving between steps.
+    // Activated by passing bottleneckConfig to runSchedulingEngine.
+    constraintFeedBoost: 2.0,               // Multiplier for tasks 1 step upstream of constraint
+    constraintFeedDecay: 0.5,               // Decay per additional step (2 steps = boost * decay)
 };
 
 const TEAM_SORT_ORDER = ['Receiving', 'CNC', 'Metal', 'Scenic', 'Paint', 'Carpentry', 'Assembly', 'Tech', 'QC', 'Hybrid'];
@@ -114,6 +121,11 @@ const runSchedulingEngine = async (
     // When absent or when weights.enableStoreUrgencyBoost is false, the boost
     // is a no-op (multiplier = 1 for every task).
     storeDueDateMap = null,
+    // Optional array of {team, weight} from the UI's bottleneckConfig.
+    // When present, tasks whose completion feeds a constraint team within 1-2
+    // steps get a priority boost (constraintFeedBoost × weight) to reduce
+    // dwell time between operations flowing into the constraint.
+    bottleneckConfig = null,
 ) => {
     const logs = [];
     let error = '';
@@ -322,6 +334,42 @@ const runSchedulingEngine = async (
             if (!schedulableTasksMap.has(key)) schedulableTasksMap.set(key, []);
             schedulableTasksMap.get(key).push(task);
         });
+
+        // --- Bottleneck / constraint-feeding setup ---
+        // For each task, check if completing it feeds a constraint team within
+        // 1-2 steps. If so, record the boost so the priority calc can apply it.
+        // Uses the UI's bottleneckConfig (array of {team, weight}) to identify
+        // which teams are constraints.
+        const constraintFeedMap = new Map(); // TaskID → multiplier
+        if (bottleneckConfig && bottleneckConfig.length > 0) {
+            const constraintWeights = new Map();
+            for (const bt of bottleneckConfig) {
+                constraintWeights.set(bt.team, bt.weight || 1);
+            }
+            for (const [skuKey, tasks] of schedulableTasksMap.entries()) {
+                const sorted = [...tasks].sort((a, b) => a.Order - b.Order);
+                for (let i = 0; i < sorted.length; i++) {
+                    // Don't boost tasks ON the constraint team — only upstream feeders
+                    if (constraintWeights.has(sorted[i].Team)) continue;
+                    let bestBoost = 0;
+                    for (let ahead = 1; ahead <= 2 && i + ahead < sorted.length; ahead++) {
+                        const downstream = sorted[i + ahead];
+                        const cWeight = constraintWeights.get(downstream.Team);
+                        if (cWeight) {
+                            const decay = ahead === 1 ? 1.0 : weights.constraintFeedDecay;
+                            const boost = weights.constraintFeedBoost * decay * cWeight;
+                            if (boost > bestBoost) bestBoost = boost;
+                            break; // Use closest constraint
+                        }
+                    }
+                    if (bestBoost > 0) {
+                        constraintFeedMap.set(sorted[i].TaskID, bestBoost);
+                    }
+                }
+            }
+            const constraintTeamNames = [...constraintWeights.keys()].join(', ');
+            logs.push(`Bottleneck awareness ENABLED: constraint teams [${constraintTeamNames}], ${constraintFeedMap.size} upstream tasks boosted (feedBoost=${weights.constraintFeedBoost}, decay=${weights.constraintFeedDecay}).`);
+        }
 
         // =========================================================
         // ASSEMBLY GROUP SYNCHRONIZATION - Data Structure Setup
@@ -786,13 +834,18 @@ const runSchedulingEngine = async (
                     ? (storeUrgencyMultByStore.get(normalizeStore(task.Store)) || 1.0)
                     : 1.0;
 
-                task.DynamicPriority = (task.BasePriority * dueDateMultiplier * assemblyGroupMultiplier * projectTypeMultiplier * dwellMultiplier * inProgressMultiplier * storeUrgencyMultiplier) / task.TeamCapacity;
+                // Constraint-feeding boost: tasks whose completion unblocks a
+                // bottleneck/constraint team get boosted so the constraint stays fed.
+                const constraintFeedMultiplier = constraintFeedMap.get(task.TaskID) || 1.0;
+
+                task.DynamicPriority = (task.BasePriority * dueDateMultiplier * assemblyGroupMultiplier * projectTypeMultiplier * dwellMultiplier * inProgressMultiplier * storeUrgencyMultiplier * constraintFeedMultiplier) / task.TeamCapacity;
                 task._dueDateMultiplier = dueDateMultiplier;
                 task._assemblyGroupMultiplier = assemblyGroupMultiplier;
                 // _projectTypeMultiplier already set at setup — it's stable across the run.
                 task._dwellMultiplier = dwellMultiplier;
                 task._inProgressMultiplier = inProgressMultiplier;
                 task._storeUrgencyMultiplier = storeUrgencyMultiplier;
+                task._constraintFeedMultiplier = constraintFeedMultiplier;
             });
             timings.inc('priorityCalc.ms', perfNow() - _pPriStart);
 
@@ -820,7 +873,7 @@ const runSchedulingEngine = async (
                         BasePriority: Number(t.BasePriority.toFixed(2)),
                         DueDateMultiplier: Number((t._dueDateMultiplier || 1).toFixed(2)),
                         ProjectTypeMultiplier: Number((t._projectTypeMultiplier || 1).toFixed(2)),
-                        BottleneckMultiplier: 1,
+                        BottleneckMultiplier: Number((t._constraintFeedMultiplier || 1).toFixed(2)),
                         DwellMultiplier: Number((t._dwellMultiplier || 1).toFixed(2)),
                         InProgressMultiplier: Number((t._inProgressMultiplier || 1).toFixed(2)),
                         TeamCapacity: t.TeamCapacity,

@@ -2460,7 +2460,7 @@ app.post('/api/schedule', async (req, res) => {
     const {
         projectTasks, params, teamDefs, ptoEntries, teamMemberChanges,
         workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
-        startDateOverrides, endDateOverrides
+        startDateOverrides, endDateOverrides, bottleneckConfig
     } = req.body;
 
     if (!projectTasks || !params || !teamDefs) {
@@ -2547,7 +2547,9 @@ app.post('/api/schedule', async (req, res) => {
                 startDateOverrides, endDateOverrides,
                 updateProgress,
                 undefined,
-                timings
+                timings,
+                null,  // storeDueDateMap (not available on /api/schedule path)
+                bottleneckConfig || null
             );
             timings.mark('engineCall.end');
 
@@ -2680,7 +2682,8 @@ app.post('/api/optimize-run', async (req, res) => {
         workHourOverrides, hybridWorkers, efficiencyData, teamMemberNameMap,
         startDateOverrides, endDateOverrides,
         priorityWeights, storeDueDatesCsv, skipDbFilter,
-        horizonMonths  // optional; when present (e.g. 3), restricts engine input + scoring to stores due within that window
+        horizonMonths,  // optional; when present (e.g. 3), restricts engine input + scoring to stores due within that window
+        bottleneckConfig  // optional; array of {team, weight} identifying constraint teams
     } = req.body;
 
     if (!projectTasks || !params || !teamDefs) {
@@ -2903,7 +2906,8 @@ app.post('/api/optimize-run', async (req, res) => {
                 updateProgress,
                 priorityWeights || undefined,
                 timings,
-                storeDueDateMap
+                storeDueDateMap,
+                bottleneckConfig || null
             );
             timings.mark('engineCall.end');
 
