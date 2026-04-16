@@ -3,9 +3,10 @@
  *
  * Scoring is 0-100 composite with weighted categories:
  *   - NSO/Infill Completion Buffer: 40% — optimal = 3-5 days early
- *   - Labor Efficiency: 30% — output value ÷ paid hours, $93/hr baseline
- *   - Labor Cost: 20% — minimize OT at $45.81/hr premium
+ *   - Labor Efficiency: 27% — output value ÷ paid hours, $139.52/hr baseline
+ *   - Labor Cost: 18% — minimize OT at $45.81/hr premium
  *   - Reno/PC Adherence: 10% — up to 14 days flex, sliding penalty
+ *   - Dwell / Flow: 5% — penalizes work-in-progress sitting idle between steps
  *
  * NSO gate: Sliding tolerance based on distance from today (capped at 10 days).
  * Infill gate: Must also hit delivery dates (same tolerance logic).
@@ -245,7 +246,7 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
             grade: 'F',
             gradeSummary: `Engine error: ${engineResult.error}`,
             feasible: false,
-            categories: { buffer: 0, laborEfficiency: 0, laborCost: 0, adherence: 0 },
+            categories: { buffer: 0, laborEfficiency: 0, laborCost: 0, adherence: 0, dwell: 0 },
             nsoViolations: [{ store: 'ENGINE_ERROR', reason: engineResult.error }],
             nsoWarnings: [],
             storeBreakdown: [],
@@ -383,19 +384,19 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
 
     if (totalPaidHours > 0) {
         laborEfficiency = totalOutputValue / totalPaidHours;
-        // $93/hr = 20/30 points. Linear scale, no ceiling but asymptotic above baseline.
+        // $139.52/hr = 18/27 points. Linear scale, no ceiling but asymptotic above baseline.
         if (laborEfficiency >= LABOR_EFFICIENCY_BASELINE) {
-            // Above baseline: 20 + up to 10 bonus points (asymptotic)
+            // Above baseline: 18 + up to 9 bonus points (asymptotic)
             const aboveRatio = (laborEfficiency - LABOR_EFFICIENCY_BASELINE) / LABOR_EFFICIENCY_BASELINE;
-            laborEffPoints = 20 + Math.min(10, aboveRatio * 30);
+            laborEffPoints = 18 + Math.min(9, aboveRatio * 27);
         } else {
-            // Below baseline: scale down proportionally from 20
-            laborEffPoints = Math.max(0, (laborEfficiency / LABOR_EFFICIENCY_BASELINE) * 20);
+            // Below baseline: scale down proportionally from 18
+            laborEffPoints = Math.max(0, (laborEfficiency / LABOR_EFFICIENCY_BASELINE) * 18);
         }
     }
 
     // =================================================================
-    // CATEGORY 3: Labor Cost (20 points)
+    // CATEGORY 3: Labor Cost (18 points)
     // Minimize OT. Zero OT = full marks. OT premium = $45.81/hr.
     // =================================================================
     let overtimeHours = 0;
@@ -410,9 +411,9 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
     }
     const overtimeCost = overtimeHours * OT_PREMIUM_PER_HOUR;
     const baselineLaborCost = totalPaidHours * standardHoursPerDay; // Rough baseline
-    // Score: 0 OT = 20 points. More OT = fewer points.
-    // Every 100 OT hours drops ~5 points.
-    let laborCostPoints = Math.max(0, 20 - (overtimeHours / 100) * 5);
+    // Score: 0 OT = 18 points. More OT = fewer points.
+    // Every 100 OT hours drops ~4.5 points.
+    let laborCostPoints = Math.max(0, 18 - (overtimeHours / 100) * 4.5);
 
     // =================================================================
     // CATEGORY 4: Reno/PC Adherence (10 points)
@@ -426,9 +427,39 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
     }
 
     // =================================================================
+    // CATEGORY 5: Dwell / Flow (5 points)
+    // Measures WIP sitting idle between operations. Lower average workload
+    // ratio across all teams = less dwelling = better flow.
+    //
+    // teamWorkload contains per-week, per-team workloadRatio values where
+    // workloadRatio = (dwellingHours / capacity) × 100.  A ratio of 0 means
+    // nothing is waiting; 100 means a full week of capacity is queued.
+    //
+    // Scoring: avg workloadRatio ≤50 → 5 pts, 100 → 2.5 pts, 200 → 0 pts.
+    // =================================================================
+    let dwellPoints = 5; // Default: full marks when no teamWorkload data
+    let avgDwellRatio = 0;
+    if (teamWorkload && teamWorkload.length > 0) {
+        let totalRatio = 0;
+        let ratioCount = 0;
+        for (const weekData of teamWorkload) {
+            for (const team of (weekData.teams || [])) {
+                // Skip Receiving and QC — they're not production-flow relevant
+                if (team.name === 'Receiving' || team.name === 'QC') continue;
+                const ratio = team.workloadRatio || 0;
+                totalRatio += ratio;
+                ratioCount++;
+            }
+        }
+        avgDwellRatio = ratioCount > 0 ? totalRatio / ratioCount : 0;
+        // Linear scale: ≤50 = 5 pts, 200 = 0 pts
+        dwellPoints = Math.max(0, Math.min(5, 5 * (1 - Math.max(0, avgDwellRatio - 50) / 150)));
+    }
+
+    // =================================================================
     // COMPOSITE SCORE (0-100)
     // =================================================================
-    const compositeScore = Number((bufferPoints + laborEffPoints + laborCostPoints + adherencePoints).toFixed(1));
+    const compositeScore = Number((bufferPoints + laborEffPoints + laborCostPoints + adherencePoints + dwellPoints).toFixed(1));
 
     // --- Team health analysis ---
     const teamHealth = analyzeTeamHealth(teamUtilization, teamWorkload);
@@ -457,11 +488,14 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
             buffer: Number(bufferPoints.toFixed(1)),
             bufferMax: 40,
             laborEfficiency: Number(laborEffPoints.toFixed(1)),
-            laborEfficiencyMax: 30,
+            laborEfficiencyMax: 27,
             laborCost: Number(laborCostPoints.toFixed(1)),
-            laborCostMax: 20,
+            laborCostMax: 18,
             adherence: Number(adherencePoints.toFixed(1)),
             adherenceMax: 10,
+            dwell: Number(dwellPoints.toFixed(1)),
+            dwellMax: 5,
+            avgDwellRatio: Number(avgDwellRatio.toFixed(1)),
         },
 
         labor: {
