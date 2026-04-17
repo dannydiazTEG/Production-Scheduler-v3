@@ -86,9 +86,16 @@ const createDefaultTeamDefs = () => {
             { id: 7, team: 'Carpentry', operation: 'Carpentry/Woodwork' }, { id: 8, team: 'Assembly', operation: 'Final Assembly' },
             { id: 9, team: 'Tech', operation: 'Tech' }, { id: 10, team: 'Tech', operation: 'Tech Prep' },
             // New Mappings
-            { id: 11, team: 'Receiving', operation: 'Receiving' }, 
+            { id: 11, team: 'Receiving', operation: 'Receiving' },
             { id: 12, team: 'QC', operation: 'Quality Review / Testing' },
             { id: 13, team: 'Tech', operation: 'Component Testing' },
+            { id: 14, team: 'Receiving', operation: 'Assembly Kitting' },
+            { id: 15, team: 'Receiving', operation: 'Tech Kitting' },
+            { id: 16, team: 'Receiving', operation: 'Carpentry Kitting' },
+            { id: 17, team: 'Receiving', operation: 'Scenic Kitting' },
+            { id: 18, team: 'Receiving', operation: 'Metal Kitting' },
+            { id: 19, team: 'Receiving', operation: 'Paint Kitting' },
+            { id: 20, team: 'Receiving', operation: 'Print Kitting' },
         ],
     };
 };
