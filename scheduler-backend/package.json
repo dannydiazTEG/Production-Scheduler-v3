@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {
-    "test": "node --test test/**/*.test.js",
+    "test": "node --test",
     "start": "node server.js"
   },
   "keywords": [],
