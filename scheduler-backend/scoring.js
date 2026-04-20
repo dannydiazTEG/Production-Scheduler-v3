@@ -16,6 +16,16 @@ const MAX_NSO_TOLERANCE_DAYS = 10;
 const OT_PREMIUM_PER_HOUR = 45.81;
 const LABOR_EFFICIENCY_BASELINE = 139.52; // $/hr (TEG target output value per paid hour)
 
+/**
+ * Labor Cost score (out of 18 pts).
+ * Softer curve than the old 18 - (OT/100)*4.5 so realistic OT ranges differentiate:
+ *   0h → 18, 200h → 15, 600h → 9, 1200h → 0, 1500h → 0 (floored).
+ */
+function laborCostScore(overtimeHours) {
+    const ot = Math.max(0, overtimeHours || 0);
+    return 18 * Math.max(0, 1 - ot / 1200);
+}
+
 // --- Levenshtein distance for fuzzy store name matching ---
 function levenshtein(a, b) {
     const m = a.length, n = b.length;
@@ -685,6 +695,7 @@ module.exports = {
     bufferScore,
     renoPcScore,
     computeValueRealization,
+    laborCostScore,
     MAX_NSO_TOLERANCE_DAYS,
     OT_PREMIUM_PER_HOUR,
     LABOR_EFFICIENCY_BASELINE,

@@ -117,3 +117,32 @@ test('computeGrade: infeasible with 3+ violations = F', () => {
         nsoViolations: [{ store: 'X' }, { store: 'Y' }, { store: 'Z' }],
     }).grade, 'F');
 });
+
+// --- laborCostScore tests ---
+const { laborCostScore } = require('../scoring');
+
+test('laborCostScore: 0 OT = 18 pts', () => {
+    assert.equal(laborCostScore(0), 18);
+});
+
+test('laborCostScore: 200h OT = 15 pts', () => {
+    // 18 * (1 - 200/1200) = 18 * 5/6 = 15
+    assert.equal(laborCostScore(200), 15);
+});
+
+test('laborCostScore: 600h OT = 9 pts', () => {
+    // 18 * (1 - 600/1200) = 9
+    assert.equal(laborCostScore(600), 9);
+});
+
+test('laborCostScore: 1200h OT = 0 pts', () => {
+    assert.equal(laborCostScore(1200), 0);
+});
+
+test('laborCostScore: 1500h OT = 0 pts (floored)', () => {
+    assert.equal(laborCostScore(1500), 0);
+});
+
+test('laborCostScore: negative OT input treated as 0', () => {
+    assert.equal(laborCostScore(-50), 18);
+});
