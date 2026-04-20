@@ -141,17 +141,18 @@ function getNsoTolerance(dueDate, today) {
     return { toleranceDays, monthsOut };
 }
 
-// --- Buffer score curve (for NSO/Infill) ---
-// Optimal = 3-5 days early (100%). On due date = 60%. 1-2 early = 80%. 6-10 early = 85%. 10+ = diminishing.
-// Late (beyond tolerance) = 0% (hard gate already filters these out).
-function bufferScore(daysEarly) {
-    if (daysEarly < 0) return 0;       // Late — shouldn't reach here if hard gate passed
-    if (daysEarly === 0) return 60;     // On the due date
-    if (daysEarly <= 2) return 60 + (daysEarly / 2) * 20;  // 1d=70, 2d=80
-    if (daysEarly <= 5) return 80 + ((daysEarly - 2) / 3) * 20;  // 3d=87, 4d=93, 5d=100
-    if (daysEarly <= 10) return 100 - ((daysEarly - 5) / 5) * 15;  // 6d=97, 10d=85
-    // 10+ days early — diminishing
-    return Math.max(60, 85 - (daysEarly - 10) * 1.5);
+// --- Buffer score curve (for NSO/Infill), business days ---
+// Late (beyond tolerance) = 0 (hard gate already filters these). On due date = 50.
+// 1-4 bd early: 50→80 linear. 5-10 bd early: 80→100 linear (peak at 10).
+// 11-15 bd early: 100→70 linear (over-buffered — resources could have gone elsewhere).
+// 16+ bd early: max(40, 70 - (d-15)*2) — 40 floor.
+function bufferScore(businessDaysEarly) {
+    if (businessDaysEarly < 0) return 0;
+    if (businessDaysEarly === 0) return 50;
+    if (businessDaysEarly <= 4) return 50 + (businessDaysEarly / 4) * 30;       // 1=57.5, 4=80
+    if (businessDaysEarly <= 10) return 80 + ((businessDaysEarly - 4) / 6) * 20; // 5=83.3, 10=100
+    if (businessDaysEarly <= 15) return 100 - ((businessDaysEarly - 10) / 5) * 30; // 11=94, 15=70
+    return Math.max(40, 70 - (businessDaysEarly - 15) * 2);                     // 20=60, 30=40
 }
 
 // --- Reno/PC adherence curve ---
