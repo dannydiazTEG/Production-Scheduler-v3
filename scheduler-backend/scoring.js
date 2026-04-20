@@ -367,7 +367,9 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
                 nsoViolations.push({ store, dueDate, finishDate: data.maxFinishDate, latenessDays, toleranceDays, monthsOut });
             }
 
-            // Buffer score for this store (business days)
+            // Buffer score for this store (business days).
+            // When calendar-late (latenessDays > 0), force a negative bd value so bufferScore returns 0.
+            // The `|| 1` handles the edge case of a weekend finish after a weekday due (bdEarly would be 0 but it's still late).
             const effectiveBdEarly = latenessDays > 0 ? -Math.abs(bdEarly || 1) : bdEarly;
             nsoInfillStores.push({ store, daysEarly: effectiveBdEarly, bufferPts: bufferScore(effectiveBdEarly) });
         } else {
@@ -700,6 +702,8 @@ function trimEngineResult(engineResult) {
         projectedCompletion: engineResult.projectedCompletion,
         logs: (engineResult.logs || []).slice(-50),
         error: engineResult.error,
+        overtimeHours: engineResult.overtimeHours,
+        overtimeBreakdown: engineResult.overtimeBreakdown,
     };
 }
 

@@ -1341,6 +1341,7 @@ const runSchedulingEngine = async (
             teamDefs,
             holidayList,
             teamMemberChanges || [],
+            hybridWorkers || [],
         );
 
         return {

@@ -23,9 +23,10 @@ function formatDate(d) {
     return `${y}-${mo}-${da}`;
 }
 
-function computeOvertimeHours(workHourOverrides, params, ptoMap, teamDefs, holidayList, teamMemberChanges) {
+function computeOvertimeHours(workHourOverrides, params, ptoMap, teamDefs, holidayList, teamMemberChanges, hybridWorkers) {
     const standardHours = parseFloat(params.hoursPerDay) || 8;
     const headcountByTeam = new Map((teamDefs.headcounts || []).map(h => [h.name, h.count || 0]));
+    const hybridWorkerNames = new Set(((hybridWorkers || []).map(h => h.name)));
     const breakdown = [];
     let totalHours = 0;
 
@@ -49,7 +50,7 @@ function computeOvertimeHours(workHourOverrides, params, ptoMap, teamDefs, holid
                     roster.add(`${ot.team.replace(/\s/g, '')}${h + 1}`);
                 }
                 for (const c of (teamMemberChanges || [])) {
-                    if (c.team === ot.team && dayStr >= c.date) {
+                    if (c.team === ot.team && dayStr >= c.date && !hybridWorkerNames.has(c.name)) {
                         if (c.type === 'Starts') roster.add(c.name);
                         else roster.delete(c.name);
                     }

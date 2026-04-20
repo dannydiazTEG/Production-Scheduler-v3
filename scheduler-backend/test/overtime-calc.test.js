@@ -77,3 +77,22 @@ test('computeOvertimeHours: splits breakdown by team', () => {
     assert.equal(result.totalHours, 3);
     assert.equal(result.breakdown.length, 2);
 });
+
+test('computeOvertimeHours: excludes hybrid workers from base team roster', () => {
+    const overrides = [
+        { team: 'Paint', hours: 10, startDate: '2026-05-04', endDate: '2026-05-04', source: 'config' },
+    ];
+    const teamDefs = { headcounts: [{ name: 'Paint', count: 2 }] };
+    // Hybrid worker "Jane" appears in teamMemberChanges as joining Paint but is really flex
+    const teamMemberChanges = [
+        { team: 'Paint', name: 'Jane', date: '2026-05-01', type: 'Starts' },
+    ];
+    const hybridWorkers = [{ name: 'Jane', primaryTeam: 'Scenic', secondaryTeam: 'Paint' }];
+    const resultWithHybrid = computeOvertimeHours(overrides, { hoursPerDay: 8, startDate: '2026-05-04' }, {}, teamDefs, new Set(), teamMemberChanges, hybridWorkers);
+    // Base Paint roster = 2 (Paint1, Paint2). Jane excluded because hybrid. Result = 2 people × 2h = 4h.
+    assert.equal(resultWithHybrid.totalHours, 4);
+
+    // Without hybridWorkers param, Jane IS counted (backward compat) — 3 × 2 = 6h.
+    const resultWithoutHybrid = computeOvertimeHours(overrides, { hoursPerDay: 8, startDate: '2026-05-04' }, {}, teamDefs, new Set(), teamMemberChanges);
+    assert.equal(resultWithoutHybrid.totalHours, 6);
+});
