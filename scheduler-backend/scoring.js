@@ -563,14 +563,17 @@ function computeGrade(scoreData) {
         return { grade: 'D', summary: `${(nsoViolations || []).length} NSO/Infill store(s) exceed tolerance` };
     }
 
-    if (compositeScore >= 90) return { grade: 'A+', summary: 'Excellent — strong buffer, high efficiency' };
-    if (compositeScore >= 85) return { grade: 'A', summary: 'Great schedule with comfortable margins' };
-    if (compositeScore >= 80) return { grade: 'A-', summary: 'Solid schedule, minor room for improvement' };
-    if (compositeScore >= 75) return { grade: 'B+', summary: 'Good schedule, some stores tight on timing' };
-    if (compositeScore >= 70) return { grade: 'B', summary: 'Acceptable with moderate lateness' };
-    if (compositeScore >= 65) return { grade: 'B-', summary: 'Below target — review buffer and efficiency' };
-    if (compositeScore >= 55) return { grade: 'C', summary: 'Needs work — significant gaps in delivery or efficiency' };
-    return { grade: 'D', summary: 'Poor — major scheduling issues' };
+    if (compositeScore >= 97) return { grade: 'A+', summary: 'Excellent — strong buffer, high efficiency' };
+    if (compositeScore >= 93) return { grade: 'A', summary: 'Great schedule with comfortable margins' };
+    if (compositeScore >= 90) return { grade: 'A-', summary: 'Solid schedule, minor room for improvement' };
+    if (compositeScore >= 87) return { grade: 'B+', summary: 'Good schedule, some stores tight on timing' };
+    if (compositeScore >= 83) return { grade: 'B', summary: 'Acceptable — moderate efficiency or tight buffer' };
+    if (compositeScore >= 80) return { grade: 'B-', summary: 'Below target — review buffer and efficiency' };
+    if (compositeScore >= 77) return { grade: 'C+', summary: 'Needs work — buffer tight and OT or efficiency slipping' };
+    if (compositeScore >= 73) return { grade: 'C', summary: 'Significant gaps in delivery, efficiency, or OT' };
+    if (compositeScore >= 70) return { grade: 'C-', summary: 'Marginal — multiple categories below target' };
+    if (compositeScore >= 60) return { grade: 'D', summary: 'Poor — major scheduling issues' };
+    return { grade: 'F', summary: 'Failing — rework the plan from the ground up' };
 }
 
 /**

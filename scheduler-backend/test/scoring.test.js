@@ -75,3 +75,45 @@ test('bufferScore: 7 bd early between 80 and 100', () => {
     const s = bufferScore(7);
     assert.ok(s > 80 && s < 100, `expected 80 < ${s} < 100`);
 });
+
+// --- computeGrade tests with US academic scale ---
+const { computeGrade } = require('../scoring');
+
+function grade(score) {
+    return computeGrade({ compositeScore: score, feasible: true, nsoViolations: [] }).grade;
+}
+
+test('computeGrade: 97 = A+', () => assert.equal(grade(97), 'A+'));
+test('computeGrade: 96 = A', () => assert.equal(grade(96), 'A'));
+test('computeGrade: 93 = A', () => assert.equal(grade(93), 'A'));
+test('computeGrade: 92 = A-', () => assert.equal(grade(92), 'A-'));
+test('computeGrade: 90 = A-', () => assert.equal(grade(90), 'A-'));
+test('computeGrade: 89 = B+', () => assert.equal(grade(89), 'B+'));
+test('computeGrade: 87 = B+', () => assert.equal(grade(87), 'B+'));
+test('computeGrade: 86 = B', () => assert.equal(grade(86), 'B'));
+test('computeGrade: 83 = B', () => assert.equal(grade(83), 'B'));
+test('computeGrade: 82 = B-', () => assert.equal(grade(82), 'B-'));
+test('computeGrade: 80 = B-', () => assert.equal(grade(80), 'B-'));
+test('computeGrade: 79 = C+', () => assert.equal(grade(79), 'C+'));
+test('computeGrade: 77 = C+', () => assert.equal(grade(77), 'C+'));
+test('computeGrade: 76.4 = C', () => assert.equal(grade(76.4), 'C'));
+test('computeGrade: 73 = C', () => assert.equal(grade(73), 'C'));
+test('computeGrade: 72 = C-', () => assert.equal(grade(72), 'C-'));
+test('computeGrade: 70 = C-', () => assert.equal(grade(70), 'C-'));
+test('computeGrade: 69 = D', () => assert.equal(grade(69), 'D'));
+test('computeGrade: 60 = D', () => assert.equal(grade(60), 'D'));
+test('computeGrade: 59 = F', () => assert.equal(grade(59), 'F'));
+test('computeGrade: 0 = F', () => assert.equal(grade(0), 'F'));
+
+test('computeGrade: infeasible with 1 violation = D', () => {
+    assert.equal(computeGrade({
+        compositeScore: 80, feasible: false, nsoViolations: [{ store: 'X' }],
+    }).grade, 'D');
+});
+
+test('computeGrade: infeasible with 3+ violations = F', () => {
+    assert.equal(computeGrade({
+        compositeScore: 80, feasible: false,
+        nsoViolations: [{ store: 'X' }, { store: 'Y' }, { store: 'Z' }],
+    }).grade, 'F');
+});
