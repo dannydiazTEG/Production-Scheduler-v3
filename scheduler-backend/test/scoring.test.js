@@ -215,3 +215,35 @@ test('cncAdvisory: needs at least 3 sustained weeks', () => {
     ];
     assert.equal(shouldAdviseCncWeekendShift(teamUtilization, [{ store: 'X' }]), false);
 });
+
+const { scoreResult } = require('../scoring');
+
+test('scoreResult: laborCostPoints uses engineResult.overtimeHours', () => {
+    const engineResult = {
+        finalSchedule: [],
+        projectSummary: [],
+        teamUtilization: [],
+        teamWorkload: [],
+        weeklyOutput: [{ totalValue: 0, totalHoursWorked: 100 }],
+        overtimeHours: 600,  // should yield 9 pts via laborCostScore
+        overtimeBreakdown: [{ team: 'Paint', hours: 600, source: 'config' }],
+    };
+    const result = scoreResult(engineResult, new Map(), { today: new Date('2026-05-01') });
+    assert.equal(result.categories.laborCost, 9);
+    assert.equal(result.labor.overtimeHours, 600);
+    assert.equal(result.labor.overtimeBreakdown[0].team, 'Paint');
+});
+
+test('scoreResult: falls back to worked-capacity spillover when engineOvertimeHours missing', () => {
+    const engineResult = {
+        finalSchedule: [],
+        projectSummary: [],
+        teamUtilization: [
+            { week: '2026-05-04', teams: [{ name: 'Paint', worked: '150', capacity: '100', utilization: 150 }] },
+        ],
+        teamWorkload: [],
+        weeklyOutput: [{ totalValue: 0, totalHoursWorked: 100 }],
+    };
+    const result = scoreResult(engineResult, new Map(), { today: new Date('2026-05-01') });
+    assert.equal(result.labor.overtimeHours, 50);
+});

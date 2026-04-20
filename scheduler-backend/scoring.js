@@ -275,7 +275,7 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
         horizonMonths = null,
     } = options;
 
-    const { finalSchedule, projectSummary, teamUtilization, weeklyOutput, teamWorkload } = engineResult;
+    const { finalSchedule, projectSummary, teamUtilization, weeklyOutput, teamWorkload, overtimeHours: engineOvertimeHours, overtimeBreakdown } = engineResult;
 
     if (engineResult.error) {
         return {
@@ -347,8 +347,9 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
         const isInfill = data.projectTypes.has('INFILL') || datesCsvType === 'INFILL';
         const isHardGate = isNso || isInfill;
 
-        const latenessDays = Math.max(0, calendarDays(data.maxFinishDate, dueDate));
-        const daysEarly = Math.max(0, calendarDays(dueDate, data.maxFinishDate));
+        const latenessDays = Math.max(0, calendarDays(data.maxFinishDate, dueDate));  // still calendar days for tolerance gating
+        const bdEarly = businessDaysEarly(dueDate, data.maxFinishDate);  // business days for buffer scoring
+        const daysEarly = Math.max(0, bdEarly);
 
         // Tolerance for NSO/Infill
         let toleranceDays = 0, monthsOut = 0, nsoStatus = null;
@@ -366,9 +367,9 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
                 nsoViolations.push({ store, dueDate, finishDate: data.maxFinishDate, latenessDays, toleranceDays, monthsOut });
             }
 
-            // Buffer score for this store
-            const effectiveDaysEarly = latenessDays > 0 ? -latenessDays : daysEarly;
-            nsoInfillStores.push({ store, daysEarly: effectiveDaysEarly, bufferPts: bufferScore(effectiveDaysEarly) });
+            // Buffer score for this store (business days)
+            const effectiveBdEarly = latenessDays > 0 ? -Math.abs(bdEarly || 1) : bdEarly;
+            nsoInfillStores.push({ store, daysEarly: effectiveBdEarly, bufferPts: bufferScore(effectiveBdEarly) });
         } else {
             // Reno/PC
             renoPcStores.push({ store, latenessDays, adherencePts: renoPcScore(latenessDays) });
@@ -436,21 +437,21 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
     // CATEGORY 3: Labor Cost (18 points)
     // Minimize OT. Zero OT = full marks. OT premium = $45.81/hr.
     // =================================================================
-    let overtimeHours = 0;
-    for (const weekData of (teamUtilization || [])) {
-        for (const team of weekData.teams) {
-            const worked = parseFloat(team.worked) || 0;
-            const capacity = parseFloat(team.capacity) || 0;
-            if (worked > capacity && capacity > 0) {
-                overtimeHours += worked - capacity;
+    // OT hours come from the engine's overtime-calc pass, which reads workHourOverrides
+    // directly (configured OT + LLM-proposed OT). Legacy fallback to spillover detection
+    // in case engineResult lacks the field (old cached results).
+    let overtimeHours = Number(engineOvertimeHours || 0);
+    if (!overtimeHours) {
+        for (const weekData of (teamUtilization || [])) {
+            for (const team of weekData.teams) {
+                const worked = parseFloat(team.worked) || 0;
+                const capacity = parseFloat(team.capacity) || 0;
+                if (worked > capacity && capacity > 0) overtimeHours += worked - capacity;
             }
         }
     }
     const overtimeCost = overtimeHours * OT_PREMIUM_PER_HOUR;
-    const baselineLaborCost = totalPaidHours * standardHoursPerDay; // Rough baseline
-    // Score: 0 OT = 18 points. More OT = fewer points.
-    // Every 100 OT hours drops ~4.5 points.
-    let laborCostPoints = Math.max(0, 18 - (overtimeHours / 100) * 4.5);
+    const laborCostPoints = laborCostScore(overtimeHours);
 
     // =================================================================
     // CATEGORY 4: Reno/PC Adherence (10 points)
@@ -542,6 +543,7 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
             efficiencyBaseline: LABOR_EFFICIENCY_BASELINE,
             overtimeHours: Number(overtimeHours.toFixed(1)),
             overtimeCost: Number(overtimeCost.toFixed(2)),
+            overtimeBreakdown: overtimeBreakdown || [],
             otPremiumRate: OT_PREMIUM_PER_HOUR,
         },
 
