@@ -28,7 +28,7 @@ const SERVER_URL = process.env.SERVER_URL || 'https://production-scheduler-backe
 // Using an env var lets Render dashboard overrides take effect immediately,
 // without waiting for render.yaml redeploys.
 const MAX_ITERATIONS = parseInt(argOf('--iterations', process.env.OPTIMIZER_ITERATIONS || '25'));
-const DEFAULT_HORIZON_MONTHS = parseInt(argOf('--horizon', process.env.OPTIMIZER_HORIZON || '3'));
+const DEFAULT_HORIZON_MONTHS = parseInt(argOf('--horizon', process.env.OPTIMIZER_HORIZON || '6'));
 const DRY_RUN = process.argv.includes('--dry-run');
 const MODEL = process.env.OPTIMIZER_MODEL || 'claude-sonnet-4-5';
 
@@ -69,7 +69,7 @@ const SYSTEM_PROMPT = [
 You are running inside a headless cron job. Each iteration you will be shown the history so far and asked for a single proposal via the \`propose_next_run\` tool.
 
 - Omit priorityWeights fields you don't want to change — they'll fall back to their defaults.
-- \`horizonMonths\` controls how far into the future the engine simulates. We are starting at ${DEFAULT_HORIZON_MONTHS} months to get faster iterations and a cleaner signal from near-term stores. Only expand (4, 5, 6...) if scores plateau with clear headroom and you believe broader context would change the answer.
+- The scoring horizon is fixed at 6 months. You do not propose this — it is locked at the API level. Focus your proposals on tunable parameters (priorityWeights, flex, OT, hires, scheduleParams).
 - Keep \`reasoning\` to 2-4 sentences: what you changed and why.
 - If the last run was infeasible (NSO/Infill violations), prioritize fixing that — higher NSO multiplier, higher pastDueBase, or raise dueDateNumerator.
 
@@ -136,12 +136,6 @@ const PROPOSE_TOOL = {
                     dwellCap: { type: 'number', minimum: 1.0, maximum: 10.0 },
                 },
             },
-            horizonMonths: {
-                type: 'integer',
-                description: 'Months of store due dates to include. Start at 3; only expand if scores plateau.',
-                minimum: 3,
-                maximum: 12,
-            },
             flexWorkers: {
                 type: 'array',
                 description: 'Move existing team members between teams (Phase 2). Immediate effect, no hiring cost. ONLY allowed routes: Paint↔Scenic, Carpentry↔Assembly, Tech→Metal. Max 20% of source team can flex out. Each entry reduces fromTeam by 1 and adds a hybrid worker.',
@@ -207,7 +201,7 @@ const PROPOSE_TOOL = {
                 description: 'Brief rationale (2-4 sentences) for this proposal.',
             },
         },
-        required: ['priorityWeights', 'horizonMonths', 'reasoning'],
+        required: ['priorityWeights', 'reasoning'],
     },
 };
 
@@ -693,7 +687,7 @@ Keep it under 400 words. Be concrete and actionable.`;
 // --- Helpers ---
 
 function describeProposal(proposal) {
-    const parts = [`h=${proposal.horizonMonths}mo`];
+    const parts = [`h=${DEFAULT_HORIZON_MONTHS}mo`];
     const pw = proposal.priorityWeights || {};
     const flat = flattenWeights(pw);
     if (Object.keys(flat).length > 0) parts.push(Object.entries(flat).map(([k, v]) => `${k}=${v}`).join(', '));
@@ -871,7 +865,7 @@ async function main() {
                 iteration: iter,
                 score: 0,
                 feasible: false,
-                horizonMonths: proposal.horizonMonths,
+                horizonMonths: DEFAULT_HORIZON_MONTHS,
                 paramChanges: describeProposal(proposal),
                 reasoning: proposal.reasoning,
             });
@@ -882,7 +876,7 @@ async function main() {
         try {
             // Pass the baseline's DB-filtered task set so every iteration sees the
             // same ground truth as the baseline did.
-            const result = await runWithConfig(data, proposal, proposal.horizonMonths, /* skipDbFilter */ true, preparedTasks);
+            const result = await runWithConfig(data, proposal, DEFAULT_HORIZON_MONTHS, /* skipDbFilter */ true, preparedTasks);
             const runMs = Date.now() - runStart;
             iterStats.runMs += runMs;
             const cacheHit = result.fromCache === true;
@@ -901,7 +895,7 @@ async function main() {
                 iteration: iter,
                 score: s.compositeScore,
                 feasible: s.feasible,
-                horizonMonths: proposal.horizonMonths,
+                horizonMonths: DEFAULT_HORIZON_MONTHS,
                 paramChanges: describeProposal(proposal),
                 reasoning: proposal.reasoning,
                 priorityWeights: proposal.priorityWeights || {},
@@ -921,7 +915,7 @@ async function main() {
                 iteration: iter,
                 score: 0,
                 feasible: false,
-                horizonMonths: proposal.horizonMonths,
+                horizonMonths: DEFAULT_HORIZON_MONTHS,
                 paramChanges: `ERROR: ${e.message.slice(0, 80)}`,
                 reasoning: proposal.reasoning,
             });
