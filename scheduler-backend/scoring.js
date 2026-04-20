@@ -72,6 +72,32 @@ function calendarDays(dateA, dateB) {
     return Math.round((a - b) / (24 * 60 * 60 * 1000));
 }
 
+/**
+ * Count business days (Mon-Fri) between finishDate and dueDate.
+ * Returns positive when finishDate is before dueDate (early), negative when late.
+ * No holiday calendar — weekdays only.
+ */
+function businessDaysEarly(dueDate, finishDate) {
+    const due = parseLocalDate(dueDate);
+    const finish = parseLocalDate(finishDate);
+    due.setHours(0, 0, 0, 0);
+    finish.setHours(0, 0, 0, 0);
+
+    if (due.getTime() === finish.getTime()) return 0;
+
+    const sign = finish < due ? 1 : -1;
+    const [start, end] = finish < due ? [finish, due] : [due, finish];
+
+    let count = 0;
+    const cursor = new Date(start.getTime());
+    while (cursor < end) {
+        cursor.setDate(cursor.getDate() + 1);
+        const dow = cursor.getDay();
+        if (dow !== 0 && dow !== 6) count++;
+    }
+    return sign * count;
+}
+
 // --- Horizon filter helper ---
 /**
  * Build the set of normalized store names whose due date falls within the horizon window.
@@ -648,6 +674,7 @@ module.exports = {
     parseLocalDate,
     getInHorizonStoreNames,
     calendarDays,
+    businessDaysEarly,
     getNsoTolerance,
     analyzeTeamHealth,
     computeGrade,
