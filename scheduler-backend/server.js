@@ -23,6 +23,7 @@ const {
 const { prepareProjectData } = require('./data-prep');
 const { createTimings } = require('./timings');
 const cache = require('./cache');
+const { validateOptimizeRunProposal } = require('./optimize-run-validation');
 
 // --- Setup ---
 const app = express();
@@ -2697,80 +2698,9 @@ app.post('/api/optimize-run', async (req, res) => {
         return res.status(400).json({ error: jobs[jobId].error });
     }
 
-    // --- Capacity change validation (safety net for LLM-driven optimization) ---
-    // NOTE: Only validate constraints that can be attributed to LLM proposals —
-    // i.e., newly-added entries identified by synthetic naming (Flex-*, NewHire-*).
-    // Pre-existing entries from uploaded configs are left alone; they may legitimately
-    // violate constraints (e.g. manually-set 90-day OT windows).
-    const validationErrors = [];
+    const validationErrors = validateOptimizeRunProposal(req.body);
 
-    // Validate flex workers added by the optimizer (name pattern: Flex-{from}-{to}-{n}).
-    // Pre-existing hybridWorkers from the uploaded config use human names and are skipped.
-    const ALLOWED_FLEX_ROUTES = new Set([
-        'Paint→Scenic', 'Scenic→Paint',
-        'Carpentry→Assembly', 'Assembly→Carpentry',
-        'Tech→Metal',
-    ]);
-    const NO_FLEX_TEAMS = new Set(['CNC', 'Receiving', 'QC']);
-    if (hybridWorkers?.length > 0) {
-        const baseHC = new Map((teamDefs.headcounts || []).map(h => [h.name, h.count]));
-        const flexFromCount = new Map();
-        for (const hw of hybridWorkers) {
-            if (!hw.name?.startsWith('Flex-')) continue;  // skip pre-existing
-            const route = `${hw.primaryTeam}→${hw.secondaryTeam}`;
-            if (!ALLOWED_FLEX_ROUTES.has(route)) {
-                validationErrors.push(`Invalid flex route: ${route}. Allowed: Paint↔Scenic, Carpentry↔Assembly, Tech→Metal.`);
-            }
-            if (NO_FLEX_TEAMS.has(hw.primaryTeam)) {
-                validationErrors.push(`Cannot flex from ${hw.primaryTeam} — too specialized.`);
-            }
-            const count = (flexFromCount.get(hw.primaryTeam) || 0) + 1;
-            flexFromCount.set(hw.primaryTeam, count);
-            const teamHC = baseHC.get(hw.primaryTeam) || 0;
-            const maxFlex = Math.floor(teamHC * 0.20);
-            if (count > maxFlex) {
-                validationErrors.push(`Too many flex from ${hw.primaryTeam}: ${count} exceeds 20% cap (${maxFlex} max of ${teamHC}).`);
-            }
-        }
-    }
-
-    // Validate OT windows — only hours/day cap (applies to all entries). Window duration,
-    // cooldown, and overlap are NOT enforced here because uploaded configs legitimately have
-    // long manually-set windows. The LLM prompt handles those constraints.
-    if (workHourOverrides?.length > 0) {
-        for (const ot of workHourOverrides) {
-            const hours = parseFloat(ot.hours);
-            if (hours > 10) {
-                validationErrors.push(`OT window for ${ot.team}: ${hours}h/day exceeds max 10h.`);
-            }
-        }
-    }
-
-    // Validate new hires added by the optimizer (name pattern: NewHire-*).
-    // Existing hires/departures from uploaded config use real names and are skipped.
-    if (teamMemberChanges?.length > 0) {
-        const hiresByTeam = new Map();
-        const scheduleStart = params.startDate ? new Date(params.startDate) : new Date();
-        const earliestHire = new Date(scheduleStart);
-        earliestHire.setDate(earliestHire.getDate() + 28);
-        for (const change of teamMemberChanges) {
-            if (change.type === 'Starts' && change.name?.startsWith('NewHire')) {
-                const team = change.team;
-                hiresByTeam.set(team, (hiresByTeam.get(team) || 0) + 1);
-                if (hiresByTeam.get(team) > 3) {
-                    validationErrors.push(`Too many hires for ${team}: ${hiresByTeam.get(team)} exceeds max +3.`);
-                }
-                if (change.date && new Date(change.date) < earliestHire) {
-                    validationErrors.push(`Hire for ${team} starts ${change.date}, before earliest allowed ${earliestHire.toISOString().slice(0, 10)} (28d after schedule start).`);
-                }
-            }
-        }
-    }
-
-    // productivityAssumption intentionally NOT validated at the API level — the server
-    // can't distinguish the uploaded config value (e.g. 0.81 for external reporting) from
-    // an LLM-proposed change. Enforcement lives in the LLM prompt and in optimizer-cron's
-    // validateAndCleanProposal (which strips scheduleParams.productivityAssumption).
+    // productivityAssumption intentionally NOT validated at the API level (see optimizer-cron).
 
     if (validationErrors.length > 0) {
         jobs[jobId].status = 'error';

@@ -11,6 +11,7 @@
 // =================================================================
 
 const { NOOP_TIMINGS } = require('./timings');
+const { computeOvertimeHours } = require('./overtime-calc');
 
 // --- Default Priority Weights ---
 // These are the 12 tunable parameters that drive the priority scoring formula.
@@ -1333,6 +1334,16 @@ const runSchedulingEngine = async (
         timings.mark('engine.finalize.end');
         timings.mark('engine.total.end');
 
+        const otData = computeOvertimeHours(
+            workHourOverrides || [],
+            params,
+            ptoMap,
+            teamDefs,
+            holidayList,
+            teamMemberChanges || [],
+            hybridWorkers || [],
+        );
+
         return {
             finalSchedule,
             projectSummary,
@@ -1344,6 +1355,8 @@ const runSchedulingEngine = async (
             projectedCompletion,
             dailyPrioritySnapshots,
             completedOperations: completed_operations,
+            overtimeHours: otData.totalHours,
+            overtimeBreakdown: otData.breakdown,
             logs,
             error,
             timings: timings.report(),

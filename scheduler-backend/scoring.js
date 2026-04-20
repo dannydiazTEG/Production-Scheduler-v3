@@ -16,6 +16,16 @@ const MAX_NSO_TOLERANCE_DAYS = 10;
 const OT_PREMIUM_PER_HOUR = 45.81;
 const LABOR_EFFICIENCY_BASELINE = 139.52; // $/hr (TEG target output value per paid hour)
 
+/**
+ * Labor Cost score (out of 18 pts).
+ * Softer curve than the old 18 - (OT/100)*4.5 so realistic OT ranges differentiate:
+ *   0h → 18, 200h → 15, 600h → 9, 1200h → 0, 1500h → 0 (floored).
+ */
+function laborCostScore(overtimeHours) {
+    const ot = Math.max(0, overtimeHours || 0);
+    return 18 * Math.max(0, 1 - ot / 1200);
+}
+
 // --- Levenshtein distance for fuzzy store name matching ---
 function levenshtein(a, b) {
     const m = a.length, n = b.length;
@@ -72,6 +82,32 @@ function calendarDays(dateA, dateB) {
     return Math.round((a - b) / (24 * 60 * 60 * 1000));
 }
 
+/**
+ * Count business days (Mon-Fri) between finishDate and dueDate.
+ * Returns positive when finishDate is before dueDate (early), negative when late.
+ * No holiday calendar — weekdays only.
+ */
+function businessDaysEarly(dueDate, finishDate) {
+    const due = parseLocalDate(dueDate);
+    const finish = parseLocalDate(finishDate);
+    due.setHours(0, 0, 0, 0);
+    finish.setHours(0, 0, 0, 0);
+
+    if (due.getTime() === finish.getTime()) return 0;
+
+    const sign = finish < due ? 1 : -1;
+    const [start, end] = finish < due ? [finish, due] : [due, finish];
+
+    let count = 0;
+    const cursor = new Date(start.getTime());
+    while (cursor < end) {
+        cursor.setDate(cursor.getDate() + 1);
+        const dow = cursor.getDay();
+        if (dow !== 0 && dow !== 6) count++;
+    }
+    return sign * count;
+}
+
 // --- Horizon filter helper ---
 /**
  * Build the set of normalized store names whose due date falls within the horizon window.
@@ -115,17 +151,18 @@ function getNsoTolerance(dueDate, today) {
     return { toleranceDays, monthsOut };
 }
 
-// --- Buffer score curve (for NSO/Infill) ---
-// Optimal = 3-5 days early (100%). On due date = 60%. 1-2 early = 80%. 6-10 early = 85%. 10+ = diminishing.
-// Late (beyond tolerance) = 0% (hard gate already filters these out).
-function bufferScore(daysEarly) {
-    if (daysEarly < 0) return 0;       // Late — shouldn't reach here if hard gate passed
-    if (daysEarly === 0) return 60;     // On the due date
-    if (daysEarly <= 2) return 60 + (daysEarly / 2) * 20;  // 1d=70, 2d=80
-    if (daysEarly <= 5) return 80 + ((daysEarly - 2) / 3) * 20;  // 3d=87, 4d=93, 5d=100
-    if (daysEarly <= 10) return 100 - ((daysEarly - 5) / 5) * 15;  // 6d=97, 10d=85
-    // 10+ days early — diminishing
-    return Math.max(60, 85 - (daysEarly - 10) * 1.5);
+// --- Buffer score curve (for NSO/Infill), business days ---
+// Late (beyond tolerance) = 0 (hard gate already filters these). On due date = 50.
+// 1-4 bd early: 50→80 linear. 5-10 bd early: 80→100 linear (peak at 10).
+// 11-15 bd early: 100→70 linear (over-buffered — resources could have gone elsewhere).
+// 16+ bd early: max(40, 70 - (d-15)*2) — 40 floor.
+function bufferScore(businessDaysEarly) {
+    if (businessDaysEarly < 0) return 0;
+    if (businessDaysEarly === 0) return 50;
+    if (businessDaysEarly <= 4) return 50 + (businessDaysEarly / 4) * 30;       // 1=57.5, 4=80
+    if (businessDaysEarly <= 10) return 80 + ((businessDaysEarly - 4) / 6) * 20; // 5=83.3, 10=100
+    if (businessDaysEarly <= 15) return 100 - ((businessDaysEarly - 10) / 5) * 30; // 11=94, 15=70
+    return Math.max(40, 70 - (businessDaysEarly - 15) * 2);                     // 20=60, 30=40
 }
 
 // --- Reno/PC adherence curve ---
@@ -238,7 +275,7 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
         horizonMonths = null,
     } = options;
 
-    const { finalSchedule, projectSummary, teamUtilization, weeklyOutput, teamWorkload } = engineResult;
+    const { finalSchedule, projectSummary, teamUtilization, weeklyOutput, teamWorkload, overtimeHours: engineOvertimeHours, overtimeBreakdown } = engineResult;
 
     if (engineResult.error) {
         return {
@@ -310,8 +347,9 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
         const isInfill = data.projectTypes.has('INFILL') || datesCsvType === 'INFILL';
         const isHardGate = isNso || isInfill;
 
-        const latenessDays = Math.max(0, calendarDays(data.maxFinishDate, dueDate));
-        const daysEarly = Math.max(0, calendarDays(dueDate, data.maxFinishDate));
+        const latenessDays = Math.max(0, calendarDays(data.maxFinishDate, dueDate));  // still calendar days for tolerance gating
+        const bdEarly = businessDaysEarly(dueDate, data.maxFinishDate);  // business days for buffer scoring
+        const daysEarly = Math.max(0, bdEarly);
 
         // Tolerance for NSO/Infill
         let toleranceDays = 0, monthsOut = 0, nsoStatus = null;
@@ -329,9 +367,11 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
                 nsoViolations.push({ store, dueDate, finishDate: data.maxFinishDate, latenessDays, toleranceDays, monthsOut });
             }
 
-            // Buffer score for this store
-            const effectiveDaysEarly = latenessDays > 0 ? -latenessDays : daysEarly;
-            nsoInfillStores.push({ store, daysEarly: effectiveDaysEarly, bufferPts: bufferScore(effectiveDaysEarly) });
+            // Buffer score for this store (business days).
+            // When calendar-late (latenessDays > 0), force a negative bd value so bufferScore returns 0.
+            // The `|| 1` handles the edge case of a weekend finish after a weekday due (bdEarly would be 0 but it's still late).
+            const effectiveBdEarly = latenessDays > 0 ? -Math.abs(bdEarly || 1) : bdEarly;
+            nsoInfillStores.push({ store, daysEarly: effectiveBdEarly, bufferPts: bufferScore(effectiveBdEarly) });
         } else {
             // Reno/PC
             renoPcStores.push({ store, latenessDays, adherencePts: renoPcScore(latenessDays) });
@@ -399,21 +439,21 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
     // CATEGORY 3: Labor Cost (18 points)
     // Minimize OT. Zero OT = full marks. OT premium = $45.81/hr.
     // =================================================================
-    let overtimeHours = 0;
-    for (const weekData of (teamUtilization || [])) {
-        for (const team of weekData.teams) {
-            const worked = parseFloat(team.worked) || 0;
-            const capacity = parseFloat(team.capacity) || 0;
-            if (worked > capacity && capacity > 0) {
-                overtimeHours += worked - capacity;
+    // OT hours come from the engine's overtime-calc pass, which reads workHourOverrides
+    // directly (configured OT + LLM-proposed OT). Legacy fallback to spillover detection
+    // in case engineResult lacks the field (old cached results).
+    let overtimeHours = Number(engineOvertimeHours || 0);
+    if (!overtimeHours) {
+        for (const weekData of (teamUtilization || [])) {
+            for (const team of weekData.teams) {
+                const worked = parseFloat(team.worked) || 0;
+                const capacity = parseFloat(team.capacity) || 0;
+                if (worked > capacity && capacity > 0) overtimeHours += worked - capacity;
             }
         }
     }
     const overtimeCost = overtimeHours * OT_PREMIUM_PER_HOUR;
-    const baselineLaborCost = totalPaidHours * standardHoursPerDay; // Rough baseline
-    // Score: 0 OT = 18 points. More OT = fewer points.
-    // Every 100 OT hours drops ~4.5 points.
-    let laborCostPoints = Math.max(0, 18 - (overtimeHours / 100) * 4.5);
+    const laborCostPoints = laborCostScore(overtimeHours);
 
     // =================================================================
     // CATEGORY 4: Reno/PC Adherence (10 points)
@@ -444,8 +484,8 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
         let ratioCount = 0;
         for (const weekData of teamWorkload) {
             for (const team of (weekData.teams || [])) {
-                // Skip Receiving and QC — they're not production-flow relevant
-                if (team.name === 'Receiving' || team.name === 'QC') continue;
+                // Skip Receiving, QC, and CNC — not labor-rebalanceable flow problems
+                if (team.name === 'Receiving' || team.name === 'QC' || team.name === 'CNC') continue;
                 const ratio = team.workloadRatio || 0;
                 totalRatio += ratio;
                 ratioCount++;
@@ -505,6 +545,7 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
             efficiencyBaseline: LABOR_EFFICIENCY_BASELINE,
             overtimeHours: Number(overtimeHours.toFixed(1)),
             overtimeCost: Number(overtimeCost.toFixed(2)),
+            overtimeBreakdown: overtimeBreakdown || [],
             otPremiumRate: OT_PREMIUM_PER_HOUR,
         },
 
@@ -516,6 +557,9 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
         storeBreakdown: storeBreakdown.sort((a, b) => (b.latenessDays || 0) - (a.latenessDays || 0)),
         teamHealth,
     };
+
+    // --- CNC weekend shift advisory ---
+    result.cncWeekendShiftAdvisory = shouldAdviseCncWeekendShift(teamUtilization, nsoViolations);
 
     // --- Letter grade ---
     const gradeData = computeGrade(result);
@@ -536,14 +580,37 @@ function computeGrade(scoreData) {
         return { grade: 'D', summary: `${(nsoViolations || []).length} NSO/Infill store(s) exceed tolerance` };
     }
 
-    if (compositeScore >= 90) return { grade: 'A+', summary: 'Excellent — strong buffer, high efficiency' };
-    if (compositeScore >= 85) return { grade: 'A', summary: 'Great schedule with comfortable margins' };
-    if (compositeScore >= 80) return { grade: 'A-', summary: 'Solid schedule, minor room for improvement' };
-    if (compositeScore >= 75) return { grade: 'B+', summary: 'Good schedule, some stores tight on timing' };
-    if (compositeScore >= 70) return { grade: 'B', summary: 'Acceptable with moderate lateness' };
-    if (compositeScore >= 65) return { grade: 'B-', summary: 'Below target — review buffer and efficiency' };
-    if (compositeScore >= 55) return { grade: 'C', summary: 'Needs work — significant gaps in delivery or efficiency' };
-    return { grade: 'D', summary: 'Poor — major scheduling issues' };
+    if (compositeScore >= 97) return { grade: 'A+', summary: 'Excellent — strong buffer, high efficiency' };
+    if (compositeScore >= 93) return { grade: 'A', summary: 'Great schedule with comfortable margins' };
+    if (compositeScore >= 90) return { grade: 'A-', summary: 'Solid schedule, minor room for improvement' };
+    if (compositeScore >= 87) return { grade: 'B+', summary: 'Good schedule, some stores tight on timing' };
+    if (compositeScore >= 83) return { grade: 'B', summary: 'Acceptable — moderate efficiency or tight buffer' };
+    if (compositeScore >= 80) return { grade: 'B-', summary: 'Below target — review buffer and efficiency' };
+    if (compositeScore >= 77) return { grade: 'C+', summary: 'Needs work — buffer tight and OT or efficiency slipping' };
+    if (compositeScore >= 73) return { grade: 'C', summary: 'Significant gaps in delivery, efficiency, or OT' };
+    if (compositeScore >= 70) return { grade: 'C-', summary: 'Marginal — multiple categories below target' };
+    if (compositeScore >= 60) return { grade: 'D', summary: 'Poor — major scheduling issues' };
+    return { grade: 'F', summary: 'Failing — rework the plan from the ground up' };
+}
+
+/**
+ * CNC weekend-shift advisory: true when CNC runs >= 90% utilization for at
+ * least 3 weeks AND the schedule has at least one NSO/Infill miss.
+ * Not an LLM lever — surfaced in the email report for human review.
+ */
+function shouldAdviseCncWeekendShift(teamUtilization, nsoViolations) {
+    if (!nsoViolations || nsoViolations.length === 0) return false;
+    let sustained = 0;
+    for (const weekData of (teamUtilization || [])) {
+        const cnc = (weekData.teams || []).find(t => t.name === 'CNC');
+        if (cnc && (cnc.utilization || 0) >= 90) {
+            sustained++;
+            if (sustained >= 3) return true;
+        } else {
+            sustained = 0;
+        }
+    }
+    return false;
 }
 
 /**
@@ -560,7 +627,7 @@ function computeGrade(scoreData) {
  * reported; anything outside is considered ramp-up/wind-down and skipped.
  */
 function analyzeTeamHealth(teamUtilization, teamWorkload) {
-    const EXCLUDED_TEAMS = new Set(['Receiving', 'QC', 'Hybrid']);
+    const EXCLUDED_TEAMS = new Set(['Receiving', 'QC', 'Hybrid', 'CNC']);
     const VALLEY_THRESHOLD = 40;
     const PEAK_THRESHOLD = 150;
 
@@ -635,6 +702,8 @@ function trimEngineResult(engineResult) {
         projectedCompletion: engineResult.projectedCompletion,
         logs: (engineResult.logs || []).slice(-50),
         error: engineResult.error,
+        overtimeHours: engineResult.overtimeHours,
+        overtimeBreakdown: engineResult.overtimeBreakdown,
     };
 }
 
@@ -648,12 +717,15 @@ module.exports = {
     parseLocalDate,
     getInHorizonStoreNames,
     calendarDays,
+    businessDaysEarly,
     getNsoTolerance,
     analyzeTeamHealth,
     computeGrade,
     bufferScore,
     renoPcScore,
     computeValueRealization,
+    laborCostScore,
+    shouldAdviseCncWeekendShift,
     MAX_NSO_TOLERANCE_DAYS,
     OT_PREMIUM_PER_HOUR,
     LABOR_EFFICIENCY_BASELINE,

@@ -79,19 +79,26 @@ Array of `{ name, primaryTeam, secondaryTeam }`. These workers split time betwee
 
 **Impact:** Can help balance utilization between overloaded and underloaded teams.
 
-## 7. Horizon (`horizonMonths`)
+## Locked parameters (DO NOT propose)
 
-| Parameter | Default | Range | Effect |
-|-----------|---------|-------|--------|
-| `horizonMonths` | 3 | 3-12 | Restricts both engine input and scoring to stores whose production due dates fall within this many months of the schedule start. Stores beyond the horizon are ignored entirely. |
+- **horizonMonths**: fixed at 6. The scoring window covers 6 months of stores. You cannot change this.
+- **productivityAssumption**: fixed business decision (see system.md).
+- **globalBuffer**: floor 3%, default 6.5% (see system.md).
 
-**Why it matters:** Danny releases new schedules every 6-8 weeks. Simulating a full year on every iteration wastes compute — a 3-month horizon cuts per-iteration time ~3× and sharpens the score signal by only grading stores we'll actually ship soon.
+## Hiring caps (per-team)
 
-**Guidance:**
-- **Start at 3.** Produces the cleanest near-term signal and fastest iterations.
-- **Expand progressively.** By iteration 8-10, push to 4 months. By iteration 15, push to 5 months. This validates whether parameter improvements at shorter horizons hold when more stores come into view.
-- **Never go below 3.** Too short to meaningfully cover the planning horizon.
-- **Don't oscillate** — if you change horizon, commit to at least 2-3 iterations at the new value before switching back, so you can tell if the score change came from the horizon or the weights.
+| Team | Max additional hires |
+|------|---------------------|
+| Metal | 0 (Tech hybrid covers) |
+| Kitting | 1, with strong justification |
+| CNC | Total headcount capped at 5; request weekend shift instead if more needed |
+| Other teams | +3 |
+
+Each same-team hire must be staggered by at least 14 days. First hire's earliest start is schedule_start + 28 days; hire 2 at +42 days; hire 3 at +56 days.
+
+## CNC workload
+
+CNC dwell/flow is excluded from scoring (the bottleneck is physical — 2 machines × 2 shifts M-F — not labor rebalancing). If CNC is sustained above 90% utilization with NSO/Infill misses, the email report will surface a "consider weekend shift" advisory for human review.
 
 ## Tuning Strategy
 
