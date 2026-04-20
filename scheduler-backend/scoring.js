@@ -481,8 +481,8 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
         let ratioCount = 0;
         for (const weekData of teamWorkload) {
             for (const team of (weekData.teams || [])) {
-                // Skip Receiving and QC — they're not production-flow relevant
-                if (team.name === 'Receiving' || team.name === 'QC') continue;
+                // Skip Receiving, QC, and CNC — not labor-rebalanceable flow problems
+                if (team.name === 'Receiving' || team.name === 'QC' || team.name === 'CNC') continue;
                 const ratio = team.workloadRatio || 0;
                 totalRatio += ratio;
                 ratioCount++;
@@ -600,7 +600,7 @@ function computeGrade(scoreData) {
  * reported; anything outside is considered ramp-up/wind-down and skipped.
  */
 function analyzeTeamHealth(teamUtilization, teamWorkload) {
-    const EXCLUDED_TEAMS = new Set(['Receiving', 'QC', 'Hybrid']);
+    const EXCLUDED_TEAMS = new Set(['Receiving', 'QC', 'Hybrid', 'CNC']);
     const VALLEY_THRESHOLD = 40;
     const PEAK_THRESHOLD = 150;
 

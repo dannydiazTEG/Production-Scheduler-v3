@@ -146,3 +146,32 @@ test('laborCostScore: 1500h OT = 0 pts (floored)', () => {
 test('laborCostScore: negative OT input treated as 0', () => {
     assert.equal(laborCostScore(-50), 18);
 });
+
+// --- analyzeTeamHealth CNC exclusion tests ---
+const { analyzeTeamHealth } = require('../scoring');
+
+test('analyzeTeamHealth: CNC peak is excluded', () => {
+    const teamUtilization = [
+        { week: '2026-05-04', teams: [{ name: 'CNC', utilization: 200 }, { name: 'Paint', utilization: 50 }] },
+    ];
+    const teamWorkload = [
+        { week: '2026-05-04', teams: [
+            { name: 'CNC', workloadRatio: 400 },
+            { name: 'Paint', workloadRatio: 400 },
+        ] },
+    ];
+    const { peaks } = analyzeTeamHealth(teamUtilization, teamWorkload);
+    const peakTeams = peaks.map(p => p.team);
+    assert.ok(peakTeams.includes('Paint'), 'Paint peak kept');
+    assert.ok(!peakTeams.includes('CNC'), 'CNC peak excluded');
+});
+
+test('analyzeTeamHealth: CNC valley is excluded', () => {
+    const teamUtilization = [
+        { week: '2026-05-04', teams: [{ name: 'CNC', utilization: 60 }] },
+        { week: '2026-05-11', teams: [{ name: 'CNC', utilization: 20 }] },
+        { week: '2026-05-18', teams: [{ name: 'CNC', utilization: 60 }] },
+    ];
+    const { valleys } = analyzeTeamHealth(teamUtilization, []);
+    assert.equal(valleys.filter(v => v.team === 'CNC').length, 0, 'CNC valleys should be excluded');
+});
