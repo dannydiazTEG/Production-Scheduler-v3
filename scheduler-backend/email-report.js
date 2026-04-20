@@ -179,11 +179,27 @@ function renderScheduleComparison(baselineBreakdown, baselineScore, topRuns) {
     const runs = topRuns.slice(0, 3);
     const baseline = baselineBreakdown || [];
 
-    const storeOrder = [];
-    const seen = new Set();
-    const addStores = (arr) => { for (const s of arr || []) { if (!seen.has(s.store)) { seen.add(s.store); storeOrder.push(s.store); } } };
+    // Collect all stores (once each) and the best-known due date for each.
+    const dueDateByStore = new Map();
+    const addStores = (arr) => {
+        for (const s of (arr || [])) {
+            if (s.store && !dueDateByStore.has(s.store)) {
+                dueDateByStore.set(s.store, s.dueDate || null);
+            }
+        }
+    };
     addStores(baseline);
     for (const r of runs) addStores(r.storeBreakdown);
+
+    // Sort ascending by due date. Stores with no due date go to the bottom.
+    const storeOrder = [...dueDateByStore.keys()].sort((a, b) => {
+        const da = dueDateByStore.get(a);
+        const db = dueDateByStore.get(b);
+        if (!da && !db) return a.localeCompare(b);
+        if (!da) return 1;   // a has no due date → bottom
+        if (!db) return -1;  // b has no due date → bottom
+        return String(da).localeCompare(String(db));
+    });
 
     const baseByStore = new Map();
     for (const s of baseline) baseByStore.set(s.store, s);
