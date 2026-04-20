@@ -175,3 +175,43 @@ test('analyzeTeamHealth: CNC valley is excluded', () => {
     const { valleys } = analyzeTeamHealth(teamUtilization, []);
     assert.equal(valleys.filter(v => v.team === 'CNC').length, 0, 'CNC valleys should be excluded');
 });
+
+// --- CNC weekend shift advisory tests ---
+const { shouldAdviseCncWeekendShift } = require('../scoring');
+
+test('cncAdvisory: triggered when CNC sustained high AND NSO miss', () => {
+    const teamUtilization = [
+        { week: '2026-05-04', teams: [{ name: 'CNC', utilization: 95 }] },
+        { week: '2026-05-11', teams: [{ name: 'CNC', utilization: 92 }] },
+        { week: '2026-05-18', teams: [{ name: 'CNC', utilization: 100 }] },
+        { week: '2026-05-25', teams: [{ name: 'CNC', utilization: 91 }] },
+    ];
+    const nsoViolations = [{ store: 'LATE_STORE' }];
+    assert.equal(shouldAdviseCncWeekendShift(teamUtilization, nsoViolations), true);
+});
+
+test('cncAdvisory: not triggered when no NSO miss', () => {
+    const teamUtilization = [
+        { week: '2026-05-04', teams: [{ name: 'CNC', utilization: 95 }] },
+        { week: '2026-05-11', teams: [{ name: 'CNC', utilization: 95 }] },
+        { week: '2026-05-18', teams: [{ name: 'CNC', utilization: 95 }] },
+        { week: '2026-05-25', teams: [{ name: 'CNC', utilization: 95 }] },
+    ];
+    assert.equal(shouldAdviseCncWeekendShift(teamUtilization, []), false);
+});
+
+test('cncAdvisory: not triggered when CNC below 90', () => {
+    const teamUtilization = [
+        { week: '2026-05-04', teams: [{ name: 'CNC', utilization: 80 }] },
+        { week: '2026-05-11', teams: [{ name: 'CNC', utilization: 80 }] },
+    ];
+    assert.equal(shouldAdviseCncWeekendShift(teamUtilization, [{ store: 'X' }]), false);
+});
+
+test('cncAdvisory: needs at least 3 sustained weeks', () => {
+    const teamUtilization = [
+        { week: '2026-05-04', teams: [{ name: 'CNC', utilization: 95 }] },
+        { week: '2026-05-11', teams: [{ name: 'CNC', utilization: 95 }] },
+    ];
+    assert.equal(shouldAdviseCncWeekendShift(teamUtilization, [{ store: 'X' }]), false);
+});

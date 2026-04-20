@@ -554,6 +554,9 @@ function scoreResult(engineResult, storeDueDates, options = {}) {
         teamHealth,
     };
 
+    // --- CNC weekend shift advisory ---
+    result.cncWeekendShiftAdvisory = shouldAdviseCncWeekendShift(teamUtilization, nsoViolations);
+
     // --- Letter grade ---
     const gradeData = computeGrade(result);
     result.grade = gradeData.grade;
@@ -584,6 +587,26 @@ function computeGrade(scoreData) {
     if (compositeScore >= 70) return { grade: 'C-', summary: 'Marginal — multiple categories below target' };
     if (compositeScore >= 60) return { grade: 'D', summary: 'Poor — major scheduling issues' };
     return { grade: 'F', summary: 'Failing — rework the plan from the ground up' };
+}
+
+/**
+ * CNC weekend-shift advisory: true when CNC runs >= 90% utilization for at
+ * least 3 weeks AND the schedule has at least one NSO/Infill miss.
+ * Not an LLM lever — surfaced in the email report for human review.
+ */
+function shouldAdviseCncWeekendShift(teamUtilization, nsoViolations) {
+    if (!nsoViolations || nsoViolations.length === 0) return false;
+    let sustained = 0;
+    for (const weekData of (teamUtilization || [])) {
+        const cnc = (weekData.teams || []).find(t => t.name === 'CNC');
+        if (cnc && (cnc.utilization || 0) >= 90) {
+            sustained++;
+            if (sustained >= 3) return true;
+        } else {
+            sustained = 0;
+        }
+    }
+    return false;
 }
 
 /**
@@ -696,6 +719,7 @@ module.exports = {
     renoPcScore,
     computeValueRealization,
     laborCostScore,
+    shouldAdviseCncWeekendShift,
     MAX_NSO_TOLERANCE_DAYS,
     OT_PREMIUM_PER_HOUR,
     LABOR_EFFICIENCY_BASELINE,
