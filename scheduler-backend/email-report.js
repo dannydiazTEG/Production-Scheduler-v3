@@ -438,6 +438,17 @@ function buildReportHtml(data, includeDetails) {
     if (includeDetails) {
         // Single unified schedule comparison: baseline (with score) + top runs
         if (topRuns && topRuns.length > 0) {
+            if (bestScore && bestScore.cncWeekendShiftAdvisory) {
+                html += `
+                <div style="margin: 16px 0; padding: 12px 16px; background: #eff6ff; border-left: 4px solid #3b82f6; border-radius: 4px;">
+                    <strong style="color: #1e40af;">💡 CNC Weekend-Shift Advisory</strong><br>
+                    <span style="color: #334155; font-size: 13px;">
+                        CNC is running at sustained high utilization and NSO/Infill dates are slipping.
+                        The optimizer cannot open a weekend shift — this requires a human decision.
+                        Consider authorizing a Sat-Sun CNC shift if the schedule still shows misses.
+                    </span>
+                </div>`;
+            }
             html += renderScheduleComparison(baselineScore?.storeBreakdown, baselineScore, topRuns);
             html += renderOvertimeSection(bestScore, baselineScore?.labor?.overtimeBreakdown);
         }
