@@ -97,7 +97,8 @@ Priority weights alone cannot fix physical capacity shortages. Use this escalati
 - No overlapping windows for the same team
 
 **Phase 4 — Headcount additions (iteration 15+):** Simulate hiring. Last resort.
-- Max +3 people above current count per team
+- Per-team caps: Metal 0 (Tech hybrid covers), Kitting +1 with strong justification, CNC total cap of 5 (request weekend shift instead if more needed), other teams +3
+- Same-team hires must be staggered by at least 14 days
 - New hires cannot start until 4 weeks after the schedule start date (hiring timeline)
 - Use teamMemberChanges with a future start date, not instant headcount bumps
 

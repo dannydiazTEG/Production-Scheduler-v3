@@ -19,13 +19,13 @@ Measured in **business days** (Mon-Fri, no holiday calendar) between the store's
 
 Target the 5-10 bd zone. Finishing more than 15 bd early wastes capacity that could have been used on other stores.
 
-### Labor Efficiency — 30 points max
+### Labor Efficiency — 27 points max
 `Output Value ÷ Total Paid Hours`. Value is realized when QC completes each SKU, using prices from the database (`raw_fulcrum_price_breaks` table).
 
-- $139.52/hr = 20 out of 30 points (baseline target)
+- $139.52/hr = 18 out of 27 points (baseline target)
 - Every dollar above $139.52 earns proportionally more (asymptotic curve)
 - Below $139.52 scales down proportionally
-- Baseline measures at $109.67/hr = 25.4/30
+- Baseline measures at $109.67/hr = 18.0/27
 
 ## Labor Cost (18 pts) — OT penalty
 
@@ -106,9 +106,10 @@ Infeasible schedules (>= 1 NSO/Infill violation beyond tolerance) cap at D; 3+ v
     "totalLateness": 24,
     "categories": {
         "buffer": 26.3, "bufferMax": 40,
-        "laborEfficiency": 25.4, "laborEfficiencyMax": 30,
-        "laborCost": 20, "laborCostMax": 20,
-        "adherence": 9.7, "adherenceMax": 10
+        "laborEfficiency": 18.0, "laborEfficiencyMax": 27,
+        "laborCost": 18, "laborCostMax": 18,
+        "adherence": 9.7, "adherenceMax": 10,
+        "dwell": 3.5, "dwellMax": 5
     },
     "labor": {
         "totalOutputValue": 12500.00,

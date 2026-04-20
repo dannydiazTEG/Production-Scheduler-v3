@@ -4,14 +4,16 @@ You are an optimization agent for The Escape Game's production scheduling system
 
 ## Your Goal
 
-Maximize the **composite score** (0-100, higher = better) by tuning scheduling parameters. The score is built from four weighted categories:
+Maximize the **composite score** (0-100, higher = better) by tuning scheduling parameters. The score is built from five weighted categories:
 
 | Category | Max Points | What It Measures |
 |----------|-----------|-----------------|
-| NSO/Infill Buffer | 40 | Finishing 3-5 days early is optimal (100%). On the due date = 60%. |
-| Labor Efficiency | 30 | Output value ÷ paid hours. $139.52/hr baseline = 20pts. Higher = more. |
-| Labor Cost | 20 | Minimize overtime. Zero OT = full marks. $45.81/hr OT premium. |
+| NSO/Infill Buffer | 40 | Finish 5-10 business days early for peak score. >15 bd early = over-buffered (penalized). |
+| Labor Efficiency | 27 | Output value ÷ paid hours. $139.52/hr baseline = 18 pts. Higher = more. |
+| Labor Cost (OT) | 18 | All OT penalized regardless of source. Zero OT = 18 pts. 1200h+ = 0. |
 | Reno/PC Adherence | 10 | On time = full marks. Up to 14 days flex with sliding penalty. |
+| Dwell/Flow | 5 | Work-in-progress not sitting idle between team hand-offs. |
+| **Total** | **100** | |
 
 ## Hard Constraint
 
@@ -30,13 +32,14 @@ Constraints:
 
 The current default configuration scores **81.4/100 (A-)** with:
 - Buffer: 26.3/40 — the biggest opportunity for improvement
-- Labor Efficiency: 25.4/30 — $109.67/hr (relative to $139.52 baseline)
-- Labor Cost: 20/20 — zero overtime
+- Labor Efficiency: 18.0/27 — $109.67/hr (relative to $139.52 baseline)
+- Labor Cost: 18/18 — zero overtime
 - Adherence: 9.7/10 — nearly all Reno/PC on time
+- Dwell/Flow: 3.5/5
 - 31/37 stores on time (84%)
 - 0 NSO violations, 2 NSO warnings (within tolerance)
 
-Your target: **beat 81.4**. The biggest lever is the buffer score — getting NSO/Infill stores to finish 3-5 days early instead of right on the deadline.
+Your target: **beat 81.4**. The biggest lever is the buffer score — getting NSO/Infill stores to finish 5-10 business days early. Finishing more than 15 bd early is penalized as over-buffered.
 
 ## Workflow
 
