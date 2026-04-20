@@ -17,6 +17,15 @@ Maximize the **composite score** (0-100, higher = better) by tuning scheduling p
 
 **All NSO and INFILL stores must hit their production due dates** (with sliding tolerance based on distance from today — up to 10 days for stores 7+ months out). If any NSO/Infill store exceeds its tolerance, the configuration is marked `feasible: false`.
 
+## OT policy
+
+All overtime hours — both pre-existing config OT and your additions — count as a penalty. Your goal is to **reduce** OT hours where possible. Removing or shortening an existing OT window is a legitimate score improvement; prefer it over adding new OT.
+
+Constraints:
+- Max 10 hours/day for any OT window
+- Max continuous OT window: 1-2 months
+- Mandatory 1-month cooldown between OT windows for the same team (enforced by the engine; visible in reports)
+
 ## The Baseline
 
 The current default configuration scores **81.4/100 (A-)** with:

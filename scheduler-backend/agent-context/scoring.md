@@ -4,25 +4,20 @@
 
 Four weighted categories, each scored independently and summed:
 
-### NSO/Infill Completion Buffer — 40 points max
-Each NSO/Infill store is scored individually, then averaged and scaled to 40 points.
+## Buffer score (40 pts, NSO/Infill only)
 
-**Buffer curve (days early → % of max):**
-| Days Early | Score | Why |
-|-----------|-------|-----|
-| Late | 0% | Hard gate should catch this |
-| 0 (on due date) | 60% | On time but no safety margin |
-| 1 day | 70% | Minimal buffer |
-| 2 days | 80% | Getting comfortable |
-| 3 days | 87% | Sweet spot starts |
-| 4 days | 93% | Near optimal |
-| **5 days** | **100%** | **Optimal — peak score** |
-| 6 days | 97% | Slightly pulling work forward |
-| 8 days | 91% | Diminishing |
-| 10 days | 85% | Pulling too much forward |
-| 15 days | 78% | Unnecessarily early |
+Measured in **business days** (Mon-Fri, no holiday calendar) between the store's scheduled finish and its store-level production due date.
 
-**This is the biggest lever.** Baseline scores 26.3/40 — moving stores from "on the due date" to "3-5 days early" is the fastest path to improvement.
+| Business days early | Score |
+|---------------------|-------|
+| Late (beyond tolerance) | 0 (hard gate) |
+| 0 (on due date) | 50 |
+| 1-4 | 50 → 80 linear |
+| 5-10 | 80 → 100 linear (peak at 10) |
+| 11-15 | 100 → 70 linear |
+| 16+ | max(40, 70 − (d − 15) × 2) |
+
+Target the 5-10 bd zone. Finishing more than 15 bd early wastes capacity that could have been used on other stores.
 
 ### Labor Efficiency — 30 points max
 `Output Value ÷ Total Paid Hours`. Value is realized when QC completes each SKU, using prices from the database (`raw_fulcrum_price_breaks` table).
@@ -32,14 +27,20 @@ Each NSO/Infill store is scored individually, then averaged and scaled to 40 poi
 - Below $139.52 scales down proportionally
 - Baseline measures at $109.67/hr = 25.4/30
 
-### Labor Cost — 20 points max
-Minimize overtime hours. OT premium = $45.81/hr.
+## Labor Cost (18 pts) — OT penalty
 
-- 0 overtime hours = 20/20 (full marks)
-- Every 100 OT hours drops ~5 points
-- Baseline has 0 OT = 20/20
+All OT counts — both configured OT windows and LLM-added OT.
 
-**Tradeoff:** Adding overtime can improve buffer scores (finishing earlier) but costs labor cost points. The optimizer should find the balance.
+laborCostScore(OT_hours) = 18 × max(0, 1 − OT_hours / 1200)
+
+| OT hours | Score |
+|----------|-------|
+| 0 | 18 |
+| 200 | 15 |
+| 600 | 9 |
+| 1200+ | 0 |
+
+Eliminating an existing OT window is a score WIN, not a no-op.
 
 ### Reno/PC Adherence — 10 points max
 Non-critical project types can flex up to 14 days late with a sliding penalty.
@@ -67,19 +68,25 @@ A store that exceeds its tolerance makes the config `feasible: false`. Stores wi
 
 **Only feasible configurations should be considered as "best."**
 
-## Letter Grades
+## Grade bands
 
-| Score | Grade |
-|-------|-------|
-| 90+ | A+ |
-| 85-89 | A |
-| 80-84 | A- |
-| 75-79 | B+ |
-| 70-74 | B |
-| 65-69 | B- |
-| 55-64 | C |
-| <55 (feasible) | D |
-| Infeasible | D or F |
+Standard US academic scale.
+
+| Grade | Composite score |
+|-------|-----------------|
+| A+ | 97+ |
+| A | 93–96 |
+| A- | 90–92 |
+| B+ | 87–89 |
+| B | 83–86 |
+| B- | 80–82 |
+| C+ | 77–79 |
+| C | 73–76 |
+| C- | 70–72 |
+| D | 60–69 |
+| F | <60 |
+
+Infeasible schedules (>= 1 NSO/Infill violation beyond tolerance) cap at D; 3+ violations = F.
 
 ## Team Health (in response but not scored)
 
