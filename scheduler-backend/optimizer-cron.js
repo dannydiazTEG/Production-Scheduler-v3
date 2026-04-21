@@ -1108,19 +1108,9 @@ async function main() {
     //    upload into the scheduler UI to reproduce any of these runs.
     if (preparedTasks && preparedTasks.length > 0) {
         const taskHeaders = Object.keys(preparedTasks[0]);
-        const taskCsvRows = [taskHeaders.join(',')];
-        for (const task of preparedTasks) {
-            taskCsvRows.push(taskHeaders.map(h => {
-                const val = task[h];
-                if (val == null) return '';
-                const str = String(val);
-                return str.includes(',') || str.includes('"') || str.includes('\n')
-                    ? `"${str.replace(/"/g, '""')}"` : str;
-            }).join(','));
-        }
         attachments.push({
             filename: `tasks-${startDateStr}.csv`,
-            content: taskCsvRows.join('\n'),
+            content: toCsv(preparedTasks, taskHeaders),
         });
         console.log(`  Task CSV attachment: ${preparedTasks.length} tasks`);
     }
