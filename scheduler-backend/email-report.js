@@ -5,9 +5,41 @@
  * Env vars: GMAIL_USER, GMAIL_APP_PASSWORD
  */
 
-const nodemailer = require('nodemailer');
+// nodemailer is required lazily inside createTransporter() so this module can
+// be imported for unit tests without installing the email dependency.
+const { parseLocalDate } = require('./scoring');
+
+/**
+ * Sort store names ascending by due date. Stores with no due date sink to the
+ * bottom and are ordered alphabetically among themselves.
+ *
+ * Inputs: a Map<storeName, dueDateString>. Accepts either ISO (YYYY-MM-DD) or
+ * US (M/D/YYYY) date strings — delegates parsing to parseLocalDate so callers
+ * don't have to normalize upstream.
+ *
+ * Why this exists: an earlier version used String.localeCompare on the raw
+ * date strings, which produced lexicographic order on M/D/YYYY and put
+ * "10/10/2026" before "3/10/2026". Use numeric timestamp compare instead.
+ */
+function sortStoresByDueDate(dueDateByStore) {
+    return [...dueDateByStore.keys()].sort((a, b) => {
+        const da = dueDateByStore.get(a);
+        const db = dueDateByStore.get(b);
+        if (!da && !db) return a.localeCompare(b);
+        if (!da) return 1;   // a has no due date → bottom
+        if (!db) return -1;  // b has no due date → bottom
+        const ta = parseLocalDate(da).getTime();
+        const tb = parseLocalDate(db).getTime();
+        // Fall back to string compare only if both dates are unparseable.
+        if (isNaN(ta) && isNaN(tb)) return String(da).localeCompare(String(db));
+        if (isNaN(ta)) return 1;
+        if (isNaN(tb)) return -1;
+        return ta - tb;
+    });
+}
 
 function createTransporter() {
+    const nodemailer = require('nodemailer');
     const user = process.env.GMAIL_USER;
     const pass = process.env.GMAIL_APP_PASSWORD;
     if (!user || !pass) {
@@ -192,14 +224,7 @@ function renderScheduleComparison(baselineBreakdown, baselineScore, topRuns) {
     for (const r of runs) addStores(r.storeBreakdown);
 
     // Sort ascending by due date. Stores with no due date go to the bottom.
-    const storeOrder = [...dueDateByStore.keys()].sort((a, b) => {
-        const da = dueDateByStore.get(a);
-        const db = dueDateByStore.get(b);
-        if (!da && !db) return a.localeCompare(b);
-        if (!da) return 1;   // a has no due date → bottom
-        if (!db) return -1;  // b has no due date → bottom
-        return String(da).localeCompare(String(db));
-    });
+    const storeOrder = sortStoresByDueDate(dueDateByStore);
 
     const baseByStore = new Map();
     for (const s of baseline) baseByStore.set(s.store, s);
@@ -590,4 +615,4 @@ async function sendOptimizationReport(data, recipients) {
     return results;
 }
 
-module.exports = { sendOptimizationReport, buildReportHtml };
+module.exports = { sendOptimizationReport, buildReportHtml, sortStoresByDueDate };
