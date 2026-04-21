@@ -21,6 +21,8 @@ const fetch = require('node-fetch');
 const fs = require('fs');
 const path = require('path');
 const Anthropic = require('@anthropic-ai/sdk');
+const { toCsv } = require('./csv-format');
+const { parseLocalDate } = require('./scoring');
 
 // --- Config ---
 const SERVER_URL = process.env.SERVER_URL || 'https://production-scheduler-backend-aepw.onrender.com';
@@ -812,8 +814,17 @@ async function main() {
         } else {
             console.log(`  WARNING: server did not return preparedTasks. Subsequent runs may not match baseline.`);
         }
+        console.log(`  Baseline completed ops: ${(baseResult.completedTasks || []).length}`);
+        console.log(`  Baseline stores in scope: ${(baseResult.remainingWorkByStore || []).length}`);
     }
     const baseScore = baseResult.score;
+
+    // Build a Project → Store lookup so the completed-ops CSV can include Store.
+    // projectTasks rows are { Project, Store, Team, SKU, Operation, ... }.
+    const projectToStore = new Map();
+    for (const t of data.projectTasks) {
+        if (t.Project && !projectToStore.has(t.Project)) projectToStore.set(t.Project, t.Store || '');
+    }
 
     let bestScore = baseScore;
     let bestConfig = baseResult.configUsed;
@@ -1026,23 +1037,80 @@ async function main() {
         });
     }
 
-    // 3. Task CSV — the DB-filtered task data with the adjusted start date, ready for
+    // 3. DB-filtered-out CSV — completed ops that the DB filter removed from the baseline's
+    //    task list. Enriched with Store (via Project → Store lookup) so Danny can audit
+    //    "does Fulcrum agree that these are done?" without cross-referencing Project→Store
+    //    elsewhere.
+    const completedTasks = baseResult.completedTasks || [];
+    if (completedTasks.length > 0) {
+        const enriched = completedTasks.map(c => ({
+            Store: projectToStore.get(c.Project) || '',
+            Project: c.Project,
+            SKU: c.SKU,
+            Operation: c.Operation,
+            CompletionDate: c.CompletionDate,
+        }));
+        attachments.push({
+            filename: `db-filtered-out-${startDateStr}.csv`,
+            content: toCsv(enriched, ['Store', 'Project', 'SKU', 'Operation', 'CompletionDate']),
+        });
+        console.log(`  DB-filtered-out CSV attachment: ${completedTasks.length} completed ops`);
+    }
+
+    // 4. Remaining-work-by-store CSV — per-store rollup of the baseline's remaining
+    //    tasks, with per-team ops/hours so Danny can see which team is gating each store.
+    const remainingWorkByStore = baseResult.remainingWorkByStore || [];
+    if (remainingWorkByStore.length > 0) {
+        // Sort ascending by due date (same convention as the email comparison table).
+        // NO_DUE_DATE rows sink to the bottom — mirrors sortStoresByDueDate in email-report.js.
+        const sorted = remainingWorkByStore.slice().sort((a, b) => {
+            if (!a.dueDate && !b.dueDate) return a.store.localeCompare(b.store);
+            if (!a.dueDate) return 1;
+            if (!b.dueDate) return -1;
+            const ta = parseLocalDate(a.dueDate).getTime();
+            const tb = parseLocalDate(b.dueDate).getTime();
+            if (isNaN(ta) && isNaN(tb)) return 0;
+            if (isNaN(ta)) return 1;
+            if (isNaN(tb)) return -1;
+            return ta - tb;
+        });
+        const teamCols = ['Receiving', 'CNC', 'Metal', 'Scenic', 'Paint', 'Carpentry', 'Assembly', 'Tech', 'QC'];
+        // Flatten `teams: { Paint: { ops, hours } }` into flat columns for the CSV.
+        const flatRows = sorted.map(r => {
+            const flat = {
+                Store: r.store,
+                ProjectType: r.projectType || '',
+                Due: r.dueDate || '',
+                'Projected Finish': r.finishDate || '',
+                'Lateness Days': r.latenessDays,
+                'Total Ops': r.totalOps,
+                'Total Hours': r.totalHours,
+            };
+            for (const t of teamCols) {
+                flat[`${t} ops`] = r.teams[t].ops;
+                flat[`${t} hrs`] = r.teams[t].hours;
+            }
+            return flat;
+        });
+        const columns = [
+            'Store', 'ProjectType', 'Due', 'Projected Finish', 'Lateness Days',
+            'Total Ops', 'Total Hours',
+            ...teamCols.flatMap(t => [`${t} ops`, `${t} hrs`]),
+        ];
+        attachments.push({
+            filename: `remaining-work-by-store-${startDateStr}.csv`,
+            content: toCsv(flatRows, columns),
+        });
+        console.log(`  Remaining-work-by-store CSV attachment: ${remainingWorkByStore.length} stores`);
+    }
+
+    // 5. Task CSV — the DB-filtered task data with the adjusted start date, ready for
     //    upload into the scheduler UI to reproduce any of these runs.
     if (preparedTasks && preparedTasks.length > 0) {
         const taskHeaders = Object.keys(preparedTasks[0]);
-        const taskCsvRows = [taskHeaders.join(',')];
-        for (const task of preparedTasks) {
-            taskCsvRows.push(taskHeaders.map(h => {
-                const val = task[h];
-                if (val == null) return '';
-                const str = String(val);
-                return str.includes(',') || str.includes('"') || str.includes('\n')
-                    ? `"${str.replace(/"/g, '""')}"` : str;
-            }).join(','));
-        }
         attachments.push({
             filename: `tasks-${startDateStr}.csv`,
-            content: taskCsvRows.join('\n'),
+            content: toCsv(preparedTasks, taskHeaders),
         });
         console.log(`  Task CSV attachment: ${preparedTasks.length} tasks`);
     }
