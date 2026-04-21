@@ -21,6 +21,7 @@ const {
     TEAM_SORT_ORDER,
 } = require('./scheduling-engine');
 const { prepareProjectData } = require('./data-prep');
+const { computeStoreWorkBreakdown } = require('./store-work-breakdown');
 const { createTimings } = require('./timings');
 const cache = require('./cache');
 const { validateOptimizeRunProposal } = require('./optimize-run-validation');
@@ -2759,14 +2760,16 @@ app.post('/api/optimize-run', async (req, res) => {
 
             // Prepare tasks (DB filter for completed ops, unless skipped)
             let preparedTasks;
+            let completedTasksForReport = null;
             if (skipDbFilter) {
                 preparedTasks = projectTasks;
                 timings.note('skipDbFilter', true);
                 updateProgress(10, 'Using pre-prepared tasks (DB filter skipped)...', 'preparing');
             } else {
                 updateProgress(0, 'Preparing project data...', 'preparing');
-                const { tasks } = await prepareProjectDataLocal(projectTasks, updateProgress, timings, { fresh: forceFresh });
+                const { tasks, completedTasks } = await prepareProjectDataLocal(projectTasks, updateProgress, timings, { fresh: forceFresh });
                 preparedTasks = tasks;
+                completedTasksForReport = completedTasks;
             }
 
             if (preparedTasks.length === 0) {
@@ -2904,6 +2907,15 @@ app.post('/api/optimize-run', async (req, res) => {
             const projectTypeMap = extractProjectTypeMap(engineResult.finalSchedule || []);
             const trimmed = trimEngineResult(engineResult);
 
+            // Compute per-store remaining-work rollup so the cron can attach a CSV.
+            // Only meaningful on the baseline iteration (same task set every time).
+            const teamsToIgnoreSet = new Set(
+                String(params.teamsToIgnore || '').split(',').map(t => t.trim()).filter(Boolean)
+            );
+            const remainingWorkByStore = computeStoreWorkBreakdown(
+                preparedTasks, scoreData.storeBreakdown, storeDueDates, teamsToIgnoreSet
+            );
+
             timings.mark('serialize.start');
             const optResultPayload = {
                 score: scoreData,
@@ -2926,6 +2938,11 @@ app.post('/api/optimize-run', async (req, res) => {
                 // cron run the DB filter ONCE in the baseline, then reuse the filtered
                 // task set for all subsequent iterations without re-querying Postgres.
                 preparedTasks: (req.body.returnPreparedTasks && !skipDbFilter) ? preparedTasks : undefined,
+                // completedTasks and remainingWorkByStore are returned ONLY for the
+                // baseline iteration (same opt-in flag). Subsequent LLM iterations
+                // don't need them — they're static across the cron run.
+                completedTasks: (req.body.returnPreparedTasks && !skipDbFilter) ? completedTasksForReport : undefined,
+                remainingWorkByStore: (req.body.returnPreparedTasks && !skipDbFilter) ? remainingWorkByStore : undefined,
                 logs: (trimmed.logs || []).slice(-30)
             };
             const optSerializedBytes = Buffer.byteLength(JSON.stringify(optResultPayload), 'utf8');
