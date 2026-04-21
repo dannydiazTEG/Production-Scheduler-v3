@@ -1,6 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { sortStoresByDueDate } = require('../email-report');
+const { toCsv } = require('../csv-format');
 
 test('sortStoresByDueDate: ascending across month boundaries (M/D/YYYY)', () => {
     // Mixed month lengths — catches the lex-sort bug where "10/*" < "3/*".
@@ -67,4 +68,44 @@ test('sortStoresByDueDate: stable across year boundary', () => {
         ['2026-late', '12/20/2026'],
     ]);
     assert.deepEqual(sortStoresByDueDate(m), ['2026-late', '2027-early']);
+});
+
+test('toCsv: basic rows + columns', () => {
+    const out = toCsv([{ a: 1, b: 2 }, { a: 3, b: 4 }], ['a', 'b']);
+    assert.equal(out, 'a,b\r\n1,2\r\n3,4\r\n');
+});
+
+test('toCsv: quotes cells with commas', () => {
+    const out = toCsv([{ name: 'Foo, Inc', count: 5 }], ['name', 'count']);
+    assert.equal(out, 'name,count\r\n"Foo, Inc",5\r\n');
+});
+
+test('toCsv: escapes embedded double quotes', () => {
+    const out = toCsv([{ op: 'said "hi"' }], ['op']);
+    assert.equal(out, 'op\r\n"said ""hi"""\r\n');
+});
+
+test('toCsv: quotes cells with newlines or CR', () => {
+    const out = toCsv([{ note: 'line1\nline2' }], ['note']);
+    assert.equal(out, 'note\r\n"line1\nline2"\r\n');
+});
+
+test('toCsv: null/undefined become empty cells', () => {
+    const out = toCsv([{ a: null, b: undefined, c: 0 }], ['a', 'b', 'c']);
+    assert.equal(out, 'a,b,c\r\n,,0\r\n');
+});
+
+test('toCsv: empty rows array still emits header + trailing CRLF', () => {
+    const out = toCsv([], ['a', 'b']);
+    assert.equal(out, 'a,b\r\n');
+});
+
+test('toCsv: column order matches argument, not row key order', () => {
+    const out = toCsv([{ b: 2, a: 1 }], ['a', 'b']);
+    assert.equal(out, 'a,b\r\n1,2\r\n');
+});
+
+test('toCsv: missing keys render as empty cells', () => {
+    const out = toCsv([{ a: 1 }, { b: 2 }], ['a', 'b']);
+    assert.equal(out, 'a,b\r\n1,\r\n,2\r\n');
 });
