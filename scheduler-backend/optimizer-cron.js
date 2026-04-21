@@ -22,6 +22,7 @@ const fs = require('fs');
 const path = require('path');
 const Anthropic = require('@anthropic-ai/sdk');
 const { toCsv } = require('./csv-format');
+const { parseLocalDate } = require('./scoring');
 
 // --- Config ---
 const SERVER_URL = process.env.SERVER_URL || 'https://production-scheduler-backend-aepw.onrender.com';
@@ -1062,7 +1063,6 @@ async function main() {
     if (remainingWorkByStore.length > 0) {
         // Sort ascending by due date (same convention as the email comparison table).
         // NO_DUE_DATE rows sink to the bottom — mirrors sortStoresByDueDate in email-report.js.
-        const { parseLocalDate } = require('./scoring');
         const sorted = remainingWorkByStore.slice().sort((a, b) => {
             if (!a.dueDate && !b.dueDate) return a.store.localeCompare(b.store);
             if (!a.dueDate) return 1;

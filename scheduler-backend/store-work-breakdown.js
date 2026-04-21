@@ -41,7 +41,7 @@ function computeStoreWorkBreakdown(preparedTasks, storeBreakdown, _storeDueDates
             projectType: (s.projectTypes || []).slice().sort().join('/'),
             dueDate: s.dueDate || null,
             finishDate: s.finishDate || null,
-            latenessDays: s.latenessDays || 0,
+            latenessDays: s.latenessDays ?? 0,
             totalOps: 0,
             totalHours: 0,
             teams: emptyTeamMap(),
